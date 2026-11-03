@@ -1,0 +1,75 @@
+name: CI
+
+# 为什么 push 和 pull_request 都要跑：
+# push 保证合并进主干后是绿的；pull_request 保证评审时就能看到结果，
+# 而不是等合并之后才发现红灯。
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一个分支上连续推送时，取消还在排队的旧运行 —— 只保留最新一次结果，
+# 省分钟数也让反馈更快。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 静态检查只在一个版本上跑：ruff 和 mypy 的结果跟 Python 版本关系不大，
+  # 放到矩阵里跑三遍纯粹是浪费分钟数。
+  lint:
+    name: lint (ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and dev tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: ruff
+        run: ruff check src tests examples
+
+      - name: mypy
+        run: mypy src/nexus_agents
+
+  # 测试跑矩阵：包声明支持 3.11+，那就真的在这几个版本上验一遍，
+  # 否则 classifiers 里的版本号只是装饰。
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and dev tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: pytest
+        run: pytest --cov=nexus_agents --cov-report=term-missing
+
+      # 示例必须离线可跑：CI 里没有 API Key，跑不起来就说明示例违反了项目约定。
+      - name: examples run offline
+        run: |
+          python examples/quickstart.py
+          python examples/graph_demo.py
+          python examples/multiagent.py
