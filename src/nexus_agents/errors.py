@@ -105,3 +105,80 @@ class MaxStepsExceeded(AgentError):
     def __init__(self, max_steps: int) -> None:
         super().__init__(f"Agent did not finish within {max_steps} steps.")
         self.max_steps = max_steps
+
+
+# ---------------------------------------------------------------- Graph 层
+
+
+class GraphError(NexusError):
+    """Raised for invalid graph definitions and failed graph runs."""
+
+    default_message = "graph error"
+
+
+class DuplicateNodeError(GraphError):
+    def __init__(self, name: str) -> None:
+        super().__init__(f"Node {name!r} is already defined in this graph.")
+        self.name = name
+
+
+class NodeNotFoundError(GraphError):
+    def __init__(self, name: str, available: tuple[str, ...] = ()) -> None:
+        hint = f" Known nodes: {', '.join(available)}." if available else ""
+        super().__init__(f"Unknown node {name!r}.{hint}")
+        self.name = name
+        self.available = available
+
+
+class MissingEntryPointError(GraphError):
+    default_message = "Graph has no entry point; call set_entry_point() first."
+
+
+class UnreachableNodeError(GraphError):
+    """A node exists but no edge or branch can ever reach it."""
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        super().__init__(
+            "Unreachable node(s): "
+            + ", ".join(names)
+            + ". Add an edge or remove them."
+        )
+        self.names = names
+
+
+class InvalidRouteError(GraphError):
+    """A router returned a branch that the graph does not know."""
+
+    def __init__(self, source: str, branch: str, allowed: tuple[str, ...]) -> None:
+        super().__init__(
+            f"Router for node {source!r} returned {branch!r}, "
+            f"which is not a known node. Allowed: {', '.join(allowed)}."
+        )
+        self.source = source
+        self.branch = branch
+        self.allowed = allowed
+
+
+class GraphStepLimitExceeded(GraphError):
+    def __init__(self, max_steps: int, path: tuple[str, ...] = ()) -> None:
+        tail = " -> ".join(path[-5:]) or "<no node ran>"
+        super().__init__(
+            f"Graph did not finish within {max_steps} steps (last nodes: {tail})."
+        )
+        self.max_steps = max_steps
+        self.path = path
+
+
+# ---------------------------------------------------------------- Checkpoint 层
+
+
+class CheckpointError(GraphError):
+    """Raised when a run cannot be resumed from stored state."""
+
+    default_message = "checkpoint error"
+
+
+class ThreadNotFoundError(CheckpointError):
+    def __init__(self, thread_id: str) -> None:
+        super().__init__(f"No checkpoint stored for thread {thread_id!r}.")
+        self.thread_id = thread_id
