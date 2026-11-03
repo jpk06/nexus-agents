@@ -20,7 +20,6 @@ from nexus_agents import AgentConfig, ReActAgent, ToolRegistry, tool
 from nexus_agents.providers import ScriptedProvider, tool_call_message
 from nexus_agents.types import Role
 
-
 # ---------------------------------------------------------------- 1. 定义工具
 #
 # 工具就是普通函数。类型注解 -> JSON Schema，docstring -> 给模型看的说明。
