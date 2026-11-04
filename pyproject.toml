@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-agents"
-version = "0.2.0"
+version = "0.3.0"
 description = "A small, explicit and fully testable runtime for LLM agents and multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -71,6 +71,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # 测试里刻意使用 typing.List / Optional 等旧写法，用来验证向后兼容
 "tests/*" = ["UP006", "UP007", "UP035", "UP045"]
+# 示例里刻意使用中文原文与全角标点（检索演示要真实的中文语料）
+"examples/*" = ["RUF001"]
 
 [tool.mypy]
 python_version = "3.11"
