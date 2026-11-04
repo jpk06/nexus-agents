@@ -73,3 +73,4 @@ jobs:
           python examples/quickstart.py
           python examples/graph_demo.py
           python examples/multiagent.py
+          python examples/memory_demo.py

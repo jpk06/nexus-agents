@@ -64,6 +64,24 @@ from .graph import (
     replace,
     sum_values,
 )
+from .memory import (
+    SUMMARY_PREFIX,
+    ContextPolicy,
+    ContextResult,
+    ContextStats,
+    ConversationMemory,
+    ExtractiveSummarizer,
+    HeuristicTokenEstimator,
+    InMemoryMemoryStore,
+    LLMSummarizer,
+    MemoryRecord,
+    MemoryStore,
+    Summarizer,
+    TokenEstimator,
+    estimate_message_tokens,
+    render_transcript,
+    tokenize,
+)
 from .schema import annotation_to_json_schema, build_parameters_schema, parse_docstring
 from .tools import ToolRegistry, ToolSpec, build_tool_spec, tool
 from .tracing import EventType, TraceEvent, Tracer
@@ -80,7 +98,7 @@ from .types import (
     user_message,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     # agent
@@ -105,6 +123,23 @@ __all__ = [
     "Checkpoint",
     "Checkpointer",
     "InMemoryCheckpointer",
+    # memory
+    "SUMMARY_PREFIX",
+    "ContextPolicy",
+    "ContextResult",
+    "ContextStats",
+    "ConversationMemory",
+    "ExtractiveSummarizer",
+    "HeuristicTokenEstimator",
+    "InMemoryMemoryStore",
+    "LLMSummarizer",
+    "MemoryRecord",
+    "MemoryStore",
+    "Summarizer",
+    "TokenEstimator",
+    "estimate_message_tokens",
+    "render_transcript",
+    "tokenize",
     # tools
     "ToolRegistry",
     "ToolSpec",

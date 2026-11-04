@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Any
 
 from .errors import AgentError, MaxStepsExceeded
+from .memory import ContextPolicy, ConversationMemory
 from .providers.base import GenerateRequest, LLMProvider, LLMResponse
 from .tools import ToolRegistry, ToolSpec
 from .tracing import EventType, TraceEvent, Tracer
@@ -55,6 +56,8 @@ class AgentConfig:
     stop_on_tool_error: bool = False
     #: 连续失败到这个次数就放弃
     max_consecutive_errors: int = 3
+    #: 每次调模型前按预算裁剪上下文；None 表示原样发送（旧行为）
+    context_policy: ContextPolicy | None = None
 
     def __post_init__(self) -> None:
         if self.max_steps < 1:
@@ -131,19 +134,30 @@ class ReActAgent:
 
     # ------------------------------------------------------------ 主循环
 
-    def run(self, user_input: str, *, system: str | None = None) -> AgentResult:
+    def run(
+        self,
+        user_input: str,
+        *,
+        system: str | None = None,
+        memory: ConversationMemory | None = None,
+    ) -> AgentResult:
         """Run the loop to completion and return a full :class:`AgentResult`.
 
         这个方法是纯函数式的：不改变 agent 自身状态，同一输入 + 同一
         provider 脚本 => 同一结果，因此完全可测试。
+
+        例外只有一处刻意为之：传入 ``memory`` 时，这一轮问答应在跑完后写回
+        长期记忆 —— 记忆本来就是跨运行的副作用，藏起来反而更难推理。
         """
         config = self.config
         tracer = Tracer()
         messages: list[Message] = []
 
         prompt = system if system is not None else config.system_prompt
+        recalled = memory.recall_messages(user_input) if memory is not None else ()
         if prompt:
             messages.append(system_message(prompt))
+        messages.extend(recalled)
         messages.append(user_message(user_input))
 
         tracer.emit(
@@ -151,7 +165,10 @@ class ReActAgent:
             input=user_input,
             tools=list(self.registry.names),
             max_steps=config.max_steps,
+            recalled=len(recalled),
         )
+        if recalled:
+            tracer.emit(EventType.MEMORY_RECALL, count=len(recalled))
 
         usage = Usage()
         step = 0
@@ -163,8 +180,18 @@ class ReActAgent:
 
         while step < config.max_steps:
             step += 1
+            # 完整历史留在 messages 里（审计、结果回放都靠它），
+            # 只有发给模型的那一份被裁剪
+            request_messages = tuple(messages)
+            if config.context_policy is not None:
+                context = config.context_policy.apply(tuple(messages))
+                request_messages = context.messages
+                if context.stats.dropped or context.stats.had_summary:
+                    tracer.emit(
+                        EventType.CONTEXT_TRIMMED, step=step, **context.stats.to_dict()
+                    )
             request = GenerateRequest(
-                messages=tuple(messages),
+                messages=request_messages,
                 tools=self.registry.specs(),
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
@@ -240,6 +267,9 @@ class ReActAgent:
             stopped_reason=stopped.value,
             total_tokens=usage.total_tokens,
         )
+
+        if memory is not None and answer:
+            memory.remember_turn(user_input, answer, tags=(self.name,))
 
         return AgentResult(
             answer=answer,

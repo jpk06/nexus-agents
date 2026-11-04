@@ -9,7 +9,7 @@
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
 不依赖任何 Agent 框架，`pydantic` + `httpx` 就是全部运行时依赖。
 
-> 状态：v0.2.0，ReAct 循环 + 状态图编排已可用，通过 207 个单元测试（96% 覆盖，`graph.py` / `checkpoint.py` 100%）。记忆层、RAG、FastAPI 服务层仍在开发中，见 [路线图](#路线图)。
+> 状态：v0.3.0，ReAct 循环 + 状态图编排 + 记忆层已可用，通过 319 个单元测试（97% 覆盖，`memory.py` / `graph.py` / `checkpoint.py` / `agent.py` 100%）。RAG、FastAPI 服务层仍在开发中，见 [路线图](#路线图)。
 
 ---
 
@@ -42,6 +42,9 @@
 | 状态图编排 | `StateGraph`：条件边、循环、回边，节点是纯函数，边是数据，图可校验可导出 Mermaid |
 | 断点续跑 | 每一步都写 checkpoint，`resume(thread_id)` 从中断处继续 —— 人工审批、长流程都不会丢状态 |
 | 多智能体 | supervisor/worker 只是图的一种写法：worker 仍是普通 `ReActAgent`，完全不知道自己被编排 |
+| 上下文裁剪 | 按 token 预算裁剪历史；**工具调用与它的结果永远同进同出**，不会拼出非法请求 |
+| 摘要压缩 | 被裁掉的老对话压成一条 system 摘要，模型仍知道前面发生过什么；可离线（抽取式）也可用模型 |
+| 长期记忆 | 跨会话事实按 BM25-lite 检索（支持中文 bigram），自动注入下一次请求，零向量库依赖 |
 
 ---
 
@@ -187,6 +190,43 @@ python examples/multiagent.py   # supervisor + 三个 worker agent，审校不�
 
 ---
 
+## 记忆层
+
+Agent 跑久了只有两个结局：上下文撑爆，或者历史被一刀切干净。v0.3.0 把这两件事分开处理：
+
+```python
+from nexus_agents import ContextPolicy, ConversationMemory, ExtractiveSummarizer
+
+memory = ConversationMemory(
+    policy=ContextPolicy(
+        max_tokens=4000,                       # 发给模型的硬预算
+        summarizer=ExtractiveSummarizer(),     # 被裁掉的部分压成一条摘要（离线可用）
+    )
+)
+
+result = agent.run("客户偏好的釉色是什么？", memory=memory)
+#   ├─ 先按关键词召回相关长期记忆，作为 system 消息注入
+#   ├─ 每步调模型前按预算裁剪上下文
+#   └─ 跑完把这一轮问答写回记忆
+```
+
+三个容易被忽略、但真会出事的地方：
+
+| 问题 | 这里的处理 |
+| --- | --- |
+| `role=tool` 消息必须跟在带 `tool_calls` 的 assistant 后面，否则 API 直接 400 | 裁剪以「assistant + 它的全部 tool 结果」为**原子单元**，要么全留、要么全丢 |
+| 贪心填充预算会把空间吃光，摘要永远差一点塞不进去 | 启用摘要时先预留 1/4 预算给它 |
+| 裁完窗口从一句「没头没尾的 assistant 回复」开始 | 带 `tool_calls` 的保留（后面挂着结果），裸回复连同它回答的问题一起丢 |
+
+中文检索不引入 jieba：连续的 CJK 串切成字符 bigram（`景德镇陶瓷` → 景德 / 德镇 / 镇陶 / 陶瓷），
+配合 idf × 词频饱和 × 长度归一打分，几百到几万条记忆足够用，结果还是确定的 —— 测试可以断言排名。
+
+```bash
+python examples/memory_demo.py   # 长对话裁剪 + 摘要 + 中文召回，全离线
+```
+
+---
+
 ## 核心设计
 
 ### 控制流
@@ -230,13 +270,14 @@ result.error      # "ValueError: kaboom"
 | 控制循环 | `agent.py` | 上面四层不用动 |
 | 流程编排 | `graph.py` | 节点是纯函数，换编排方式不用动 `agent.py` |
 | 状态存储 | `checkpoint.py` | 实现 Checkpointer 协议即可换存储后端 |
+| 记忆与上下文 | `memory.py` | 换 token 估算器 / 摘要器 / 存储后端都只是实现一个协议 |
 
 ---
 
 ## 测试与质量门禁
 
 ```bash
-pytest                                            # 207 个测试，全部离线
+pytest                                            # 319 个测试，全部离线
 pytest --cov=nexus_agents --cov-report=term-missing
 ruff check src tests examples
 mypy src/nexus_agents
@@ -244,8 +285,8 @@ mypy src/nexus_agents
 
 当前状态：
 
-- **207 passed**，平均耗时 < 1 秒（无网络、无 API Key、无 sleep）
-- 覆盖率 **96%**（`graph.py`、`checkpoint.py`、`agent.py`、`types.py`、`tracing.py` 均 100%）
+- **319 passed**，平均耗时 ~2 秒（无网络、无 API Key、无 sleep）
+- 覆盖率 **97%**（`memory.py`、`graph.py`、`checkpoint.py`、`agent.py`、`types.py`、`tracing.py` 均 100%）
 - `ruff` 与 `mypy` 零告警
 
 测试替身是 `ScriptedProvider`：可以回放固定响应，也可以传一个函数按请求动态决定返回什么 —— 这样连「模型看到工具结果后怎么反应」都能精确断言。
@@ -266,17 +307,19 @@ nexus-agents/
 │   ├── tools.py           @tool / ToolSpec / ToolRegistry
 │   ├── tracing.py         事件流追踪
 │   ├── agent.py           ReAct 循环
+│   ├── memory.py          token 估算 / 检索 / 上下文裁剪 / 摘要
 │   ├── checkpoint.py      Checkpoint / Checkpointer 协议 / 内存实现
 │   ├── graph.py           StateGraph：条件边、循环、reducer、编译与执行
 │   └── providers/
 │       ├── base.py        GenerateRequest / LLMResponse / LLMProvider 协议
 │       ├── scripted.py    确定性测试替身
 │       └── openai_compat.py  OpenAI 兼容 HTTP 后端
-├── tests/                 207 个单元测试
+├── tests/                 319 个单元测试
 ├── examples/
 │   ├── quickstart.py      单 Agent 端到端示例（离线）
 │   ├── graph_demo.py      循环 / 条件边 / checkpoint / Mermaid
-│   └── multiagent.py      supervisor + worker 多智能体
+│   ├── multiagent.py      supervisor + worker 多智能体
+│   └── memory_demo.py     上下文裁剪 / 摘要压缩 / 中文长期记忆
 └── docs/architecture.md   设计说明
 ```
 
@@ -286,7 +329,7 @@ nexus-agents/
 
 - [x] v0.1.0 消息模型、工具层、ReAct 循环、Provider 抽象、追踪
 - [x] v0.2.0 状态图编排（`StateGraph`）：条件边、循环、checkpoint，支撑多智能体
-- [ ] v0.3.0 记忆层：窗口裁剪 + 摘要压缩
+- [x] v0.3.0 记忆层：token 预算裁剪（工具调用原子性）、摘要压缩、BM25-lite 长期记忆
 - [ ] v0.4.0 FastAPI 服务层：SSE 流式输出、会话持久化
 - [ ] v0.5.0 RAG 模块：切分、向量检索、重排、评测集
 - [ ] v0.6.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
