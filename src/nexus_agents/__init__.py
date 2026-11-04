@@ -26,19 +26,43 @@ Quick start
 from __future__ import annotations
 
 from .agent import AgentConfig, AgentResult, ReActAgent, Stopped
+from .checkpoint import Checkpoint, Checkpointer, InMemoryCheckpointer
 from .errors import (
     AgentError,
+    CheckpointError,
+    DuplicateNodeError,
     DuplicateToolError,
+    GraphError,
+    GraphStepLimitExceeded,
+    InvalidRouteError,
     InvalidToolArguments,
     MaxStepsExceeded,
     MissingCredentialsError,
+    MissingEntryPointError,
     NexusError,
+    NodeNotFoundError,
     ProviderError,
     ProviderResponseError,
     ProviderTransportError,
     SchemaError,
+    ThreadNotFoundError,
     ToolError,
     ToolNotFoundError,
+    UnreachableNodeError,
+)
+from .graph import (
+    END,
+    CompiledGraph,
+    GraphResult,
+    GraphStatus,
+    StateGraph,
+    append,
+    apply_update,
+    keep_first,
+    max_value,
+    merge,
+    replace,
+    sum_values,
 )
 from .schema import annotation_to_json_schema, build_parameters_schema, parse_docstring
 from .tools import ToolRegistry, ToolSpec, build_tool_spec, tool
@@ -56,7 +80,7 @@ from .types import (
     user_message,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # agent
@@ -64,6 +88,23 @@ __all__ = [
     "AgentResult",
     "ReActAgent",
     "Stopped",
+    # graph
+    "END",
+    "StateGraph",
+    "CompiledGraph",
+    "GraphResult",
+    "GraphStatus",
+    "apply_update",
+    "append",
+    "merge",
+    "replace",
+    "keep_first",
+    "sum_values",
+    "max_value",
+    # checkpoint
+    "Checkpoint",
+    "Checkpointer",
+    "InMemoryCheckpointer",
     # tools
     "ToolRegistry",
     "ToolSpec",
@@ -101,5 +142,15 @@ __all__ = [
     "MissingCredentialsError",
     "AgentError",
     "MaxStepsExceeded",
+    # graph errors
+    "GraphError",
+    "DuplicateNodeError",
+    "NodeNotFoundError",
+    "MissingEntryPointError",
+    "UnreachableNodeError",
+    "InvalidRouteError",
+    "GraphStepLimitExceeded",
+    "CheckpointError",
+    "ThreadNotFoundError",
     "__version__",
 ]

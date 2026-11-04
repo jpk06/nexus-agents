@@ -30,6 +30,13 @@ class EventType:
     TOOL_RESULT = "tool.result"
     ERROR = "error"
     MAX_STEPS = "agent.max_steps"
+    # 状态图专用（graph.py）
+    GRAPH_START = "graph.start"
+    GRAPH_END = "graph.end"
+    NODE_START = "node.start"
+    NODE_END = "node.end"
+    ROUTE = "graph.route"
+    CHECKPOINT = "graph.checkpoint"
 
 
 @dataclass(frozen=True)

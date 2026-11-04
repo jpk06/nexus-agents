@@ -3,19 +3,23 @@
 ## 分层与依赖方向
 
 ```
-        agent.py            控制循环（唯一有「流程」的地方）
-           │
+            graph.py            流程编排（节点 + 边 + checkpoint）
+               │
+           agent.py            控制循环（唯一有「模型交互」的地方）
+               │
     ┌──────┼──────────┐
     ▼      ▼          ▼
 tools.py  providers/  tracing.py
     │          │
     ▼          ▼
 schema.py   types.py  ←── 所有层共享，依赖最稳定
+
+checkpoint.py ── 只被 graph.py 依赖（存储契约，可替换）
 ```
 
 依赖**单向向下**：上层可以用下层，下层永远不知道上层存在。
 好处是替换任意一层都不用碰其它层 —— 换 LLM 后端只动 `providers/`，
-改循环策略只动 `agent.py`。
+改循环策略只动 `agent.py`，改编排方式只动 `graph.py`。
 
 ## 各层职责
 
@@ -89,6 +93,46 @@ fallback 链都不需要继承任何东西。
 3. **`while ... else` 区分「break 出来」和「条件耗尽」**，
    所以 `MAX_STEPS` 不会和 `FINAL` 混淆。
 
+### `graph.py` —— 流程编排
+
+单 Agent 适合「一件事」，真实任务是「检索 → 够不够 → 写作 → 审校 → 不过就重写」。
+写成 `if/elif` 也能跑，但很快没人敢改。这里把**节点**和**边**分开：
+
+- **节点是纯函数**：`(state) -> 局部更新`，不知道自己前后是谁
+- **边是数据**：静态边就是 `dict[source, target]`，条件边是 `(router, mapping)`
+- **流程因此可以被检查**：`compile()` 会校验入口、边的目标、以及不可达节点
+
+四个刻意的设计决定：
+
+1. **节点返回局部更新，不是整个新状态。**
+   这样节点只依赖它真正关心的字段，加字段不用改所有节点。
+2. **默认最后写入生效，累积字段显式注册 reducer。**
+   `StateGraph({"messages": append})`。两个节点都写 `messages` 时不会互相覆盖 ——
+   这是多智能体里最常见的隐蔽 bug。
+3. **节点拿到的是只读视图（`MappingProxyType`）。**
+   想直接 `state["x"] = 1` 会当场 `TypeError`，而不是悄悄影响后面的节点。
+4. **跑满步数 / 节点抛异常都进 `GraphStatus`，不假装有结果。**
+   失败的运行仍然带完整 trace 和已经跑出来的状态，方便定位。
+
+```mermaid
+graph TD
+  __start__ --> supervisor
+  research --> supervisor
+  write --> supervisor
+  review --> supervisor
+  supervisor -->|research| research
+  supervisor -->|write| write
+  supervisor -->|review| review
+```
+
+### `checkpoint.py` —— 存储契约
+
+`Checkpoint` = 线程 id + 步数 + 完整状态 + 下一个节点。存储本身只是一个 Protocol，
+内存实现保留**全部历史**（排查「状态在哪一步跑偏」时很有用）。
+
+「没有出边的节点 = 这条分支结束」，所以流程可以自然地停在中间等人类 ——
+人在外部改状态、写回同一条线程，`resume(thread_id)` 接着跑完，前面的节点不会重跑。
+
 ### `tracing.py` —— 事件流
 
 扁平的事件列表，不引入 OpenTelemetry。
@@ -105,10 +149,17 @@ fallback 链都不需要继承任何东西。
 | 未知注解 | 返回 `{}` | 抛异常 | 一个类型不该拖垮整个注册 |
 | 追踪 | 自带事件流 | OpenTelemetry | 现阶段不需要分布式追踪的重量 |
 | 消息模型 | frozen | 可变 | 一次运行中到处传，可变是隐患 |
+| 图状态 | 普通 dict | 自定义 State 类 | 序列化、合并、调试都更简单 |
+| 状态合并 | 默认覆盖 + 显式 reducer | 全部累积 | 让「两个节点写同一字段」的冲突暴露出来 |
+| 节点可见性 | 只读视图 | 直接传 dict | 就地修改是最难查的一类 bug |
+| 流程定义 | 先构建后 `compile()` 校验 | 边加边跑 | 跑不起来的图根本编译不过 |
+| 节点报错 | 记录进 status + trace，不再往下走 | 自动重试 | 重试策略该由调用方决定，不该藏在框架里 |
 
 ## 已知限制
 
-- 单 Agent，跨 Agent 编排要靠 v0.2.0 的状态图
+- 图是**串行**执行：没有并行分支（fan-out / fan-in）。真实需要并行的场景目前只能在
+  一个节点内部自己并发
+- 无异步接口 —— 图里的节点如果跑 Agent，会阻塞（v0.4.0 配合 FastAPI 一起加）
+- `Checkpointer` 只有内存实现；`ScriptedProvider` 之外的 provider 在图里跑会真的花钱
 - 无内置记忆管理，长对话会一直变长（v0.3.0 解决）
 - 只支持 function-calling 风格的工具调用，不支持从纯文本里解析 ReAct 格式
-- 无异步接口（v0.4.0 配合 FastAPI 一起加）

@@ -5,7 +5,7 @@
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
 不依赖任何 Agent 框架，`pydantic` + `httpx` 就是全部运行时依赖。
 
-> 状态：v0.1.0，核心循环已可用并通过 121 个单元测试（94% 覆盖）。多智能体编排、RAG、FastAPI 服务层仍在开发中，见 [路线图](#路线图)。
+> 状态：v0.2.0，ReAct 循环 + 状态图编排已可用，通过 207 个单元测试（96% 覆盖，`graph.py` / `checkpoint.py` 100%）。记忆层、RAG、FastAPI 服务层仍在开发中，见 [路线图](#路线图)。
 
 ---
 
@@ -35,6 +35,9 @@
 | 可观测 | 每次运行产出完整事件流（含 LLM 调用耗时），可断言、可序列化 |
 | 成本可见 | token 用量跨步累加，直接挂在结果上 |
 | 诚实终止 | 跑满 `max_steps` 一定报 `max_steps`，绝不伪装成成功 |
+| 状态图编排 | `StateGraph`：条件边、循环、回边，节点是纯函数，边是数据，图可校验可导出 Mermaid |
+| 断点续跑 | 每一步都写 checkpoint，`resume(thread_id)` 从中断处继续 —— 人工审批、长流程都不会丢状态 |
+| 多智能体 | supervisor/worker 只是图的一种写法：worker 仍是普通 `ReActAgent`，完全不知道自己被编排 |
 
 ---
 
@@ -113,6 +116,73 @@ python examples/quickstart.py
 
 ---
 
+## 状态图编排
+
+单个 Agent 适合做一件事，真实任务通常是「检索 → 判断要不要再检索 → 写作 → 审校 → 不过就重写」。
+把这些写进 `if/elif` 能跑，但会迅速变成没人敢改的意大利面。`StateGraph` 把流程显式化：
+
+```python
+from nexus_agents import END, InMemoryCheckpointer, StateGraph, append
+
+graph = StateGraph({"evidence": append})          # evidence 累积，其它字段覆盖
+
+graph.add_node("search", search)                  # 节点是纯函数：(state) -> 局部更新
+graph.add_node("write", write)
+graph.add_conditional_edges(                      # 路由函数决定下一步去哪
+    "search",
+    lambda state: "write" if len(state["evidence"]) >= 3 else "search",
+    {"search": "search", "write": "write"},
+)
+graph.set_entry_point("search")
+
+compiled = graph.compile(checkpointer=InMemoryCheckpointer(), max_steps=8)
+result = compiled.invoke({"evidence": []}, thread_id="run-1")
+
+result.path          # ('search', 'search', 'write')
+result.status        # GraphStatus.COMPLETED / MAX_STEPS / ERROR
+result.state         # 最终状态（只读视图）
+```
+
+四个关键约定：
+
+| 约定 | 为什么 |
+| --- | --- |
+| 节点返回**局部更新**，不是整个新状态 | 节点之间只通过约定字段通信，互不认识 |
+| 需要累积的字段显式注册 reducer | 否则两个节点写同一个字段会互相覆盖（默认最后写入生效） |
+| 节点拿到的是**只读视图** | 直接改状态会当场 `TypeError`，而不是悄悄污染下游节点 |
+| `compile()` 时校验 | 入口存在、边指向真实节点、没有永远走不到的节点 —— 跑不起来的图根本编译不过 |
+
+### 断点续跑
+
+```python
+partial = graph.compile(checkpointer=store, max_steps=2).invoke(state, thread_id="t1")
+# partial.status is GraphStatus.MAX_STEPS，但前两步的状态已经存好
+
+continued = graph.compile(checkpointer=store, max_steps=20).resume("t1")
+```
+
+`Checkpointer` 是个 Protocol：内存实现用于测试和单进程，换成 Redis / Postgres 只要实现
+`save` / `load` / `history` / `threads` / `clear`，图的代码一行都不用改。
+
+### 多智能体
+
+supervisor/worker 不需要新的抽象 —— worker 就是普通 `ReActAgent`，supervisor 只是一个
+「看状态、决定下一步派谁」的节点：
+
+```python
+graph.add_node("supervisor", lambda state: {})   # 只负责路由
+graph.add_conditional_edges("supervisor", route, {"research": "research", "write": "write", ...})
+for worker in ("research", "write", "review"):
+    graph.add_edge(worker, "supervisor")          # 干完回到 supervisor
+```
+
+```bash
+python examples/graph_demo.py   # 循环 + 条件边 + checkpoint + Mermaid 导出
+python examples/multiagent.py   # supervisor + 三个 worker agent，审校不通过自动重写
+```
+
+---
+
 ## 核心设计
 
 ### 控制流
@@ -154,22 +224,24 @@ result.error      # "ValueError: kaboom"
 | 工具执行 | `tools.py` | 实现 `invoke()` 即可 |
 | LLM 后端 | `providers/` | 实现 `generate(request) -> response` 一个方法 |
 | 控制循环 | `agent.py` | 上面四层不用动 |
+| 流程编排 | `graph.py` | 节点是纯函数，换编排方式不用动 `agent.py` |
+| 状态存储 | `checkpoint.py` | 实现 Checkpointer 协议即可换存储后端 |
 
 ---
 
 ## 测试与质量门禁
 
 ```bash
-pytest                                            # 121 个测试，全部离线
+pytest                                            # 207 个测试，全部离线
 pytest --cov=nexus_agents --cov-report=term-missing
-ruff check src tests
+ruff check src tests examples
 mypy src/nexus_agents
 ```
 
 当前状态：
 
-- **121 passed**，平均耗时 < 1 秒（无网络、无 API Key、无 sleep）
-- 覆盖率 **94%**
+- **207 passed**，平均耗时 < 1 秒（无网络、无 API Key、无 sleep）
+- 覆盖率 **96%**（`graph.py`、`checkpoint.py`、`agent.py`、`types.py`、`tracing.py` 均 100%）
 - `ruff` 与 `mypy` 零告警
 
 测试替身是 `ScriptedProvider`：可以回放固定响应，也可以传一个函数按请求动态决定返回什么 —— 这样连「模型看到工具结果后怎么反应」都能精确断言。
@@ -190,12 +262,17 @@ nexus-agents/
 │   ├── tools.py           @tool / ToolSpec / ToolRegistry
 │   ├── tracing.py         事件流追踪
 │   ├── agent.py           ReAct 循环
+│   ├── checkpoint.py      Checkpoint / Checkpointer 协议 / 内存实现
+│   ├── graph.py           StateGraph：条件边、循环、reducer、编译与执行
 │   └── providers/
 │       ├── base.py        GenerateRequest / LLMResponse / LLMProvider 协议
 │       ├── scripted.py    确定性测试替身
 │       └── openai_compat.py  OpenAI 兼容 HTTP 后端
-├── tests/                 121 个单元测试
-├── examples/quickstart.py 离线可跑的端到端示例
+├── tests/                 207 个单元测试
+├── examples/
+│   ├── quickstart.py      单 Agent 端到端示例（离线）
+│   ├── graph_demo.py      循环 / 条件边 / checkpoint / Mermaid
+│   └── multiagent.py      supervisor + worker 多智能体
 └── docs/architecture.md   设计说明
 ```
 
@@ -204,7 +281,7 @@ nexus-agents/
 ## 路线图
 
 - [x] v0.1.0 消息模型、工具层、ReAct 循环、Provider 抽象、追踪
-- [ ] v0.2.0 状态图编排（`Graph`）：条件边、循环、checkpoint，支撑多智能体
+- [x] v0.2.0 状态图编排（`StateGraph`）：条件边、循环、checkpoint，支撑多智能体
 - [ ] v0.3.0 记忆层：窗口裁剪 + 摘要压缩
 - [ ] v0.4.0 FastAPI 服务层：SSE 流式输出、会话持久化
 - [ ] v0.5.0 RAG 模块：切分、向量检索、重排、评测集
