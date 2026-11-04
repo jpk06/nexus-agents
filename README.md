@@ -9,7 +9,7 @@
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
 不依赖任何 Agent 框架，`pydantic` + `httpx` 就是全部运行时依赖。
 
-> 状态：v0.3.0，ReAct 循环 + 状态图编排 + 记忆层已可用，通过 319 个单元测试（97% 覆盖，`memory.py` / `graph.py` / `checkpoint.py` / `agent.py` 100%）。RAG、FastAPI 服务层仍在开发中，见 [路线图](#路线图)。
+> 状态：v0.4.0，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式已可用，通过 365 个单元测试（97% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 100%）。FastAPI 服务层、RAG、MCP 仍在开发中，见 [路线图](#路线图)。
 
 ---
 
@@ -45,6 +45,9 @@
 | 上下文裁剪 | 按 token 预算裁剪历史；**工具调用与它的结果永远同进同出**，不会拼出非法请求 |
 | 摘要压缩 | 被裁掉的老对话压成一条 system 摘要，模型仍知道前面发生过什么；可离线（抽取式）也可用模型 |
 | 长期记忆 | 跨会话事实按 BM25-lite 检索（支持中文 bigram），自动注入下一次请求，零向量库依赖 |
+| 异步运行时 | `arun` / `ainvoke` / `aresume` 全套异步入口；同步与异步共用**同一份控制流**，不会各修各的 |
+| 不阻塞 | 同步 provider 与同步工具自动进线程池；一个 `time.sleep` 的工具不会让整个服务失去响应 |
+| 事件流式 | `agent.astream()` 边跑边产出事件（工具调用、结果、耗时），最后一项是完整结果；SSE 有真东西可推，不是攒完再切片 |
 
 ---
 
@@ -227,6 +230,88 @@ python examples/memory_demo.py   # 长对话裁剪 + 摘要 + 中文召回，全
 
 ---
 
+## 异步
+
+一个 Agent 服务同时接 50 个用户时，最致命的不是慢，是**一个慢请求卡住所有人**。
+所以异步不是「加个 async 关键字」，而是三件事都得成立：
+
+```python
+import asyncio
+from nexus_agents import ReActAgent, tool
+
+@tool
+async def fetch_price(sku: str) -> str:
+    """Query a supplier API."""
+    async with client.get(f"/price/{sku}") as resp:
+        return await resp.text()
+
+agent = ReActAgent(provider, [fetch_price])
+
+# 一次请求
+result = await agent.arun("多少钱？")
+
+# 并发 50 个会话，各自独立推进
+results = await asyncio.gather(*(agent.arun(q) for q in questions))
+```
+
+三件事分别是：
+
+**1. 只有一个循环。** `arun` 是真正的实现，`run` 只是 `asyncio.run(arun(...))`。
+写成两份（同步一份、异步一份）的框架，一周之内就会分叉 —— 有人在一边修了
+停止条件，忘了另一边，于是两条路径对「Agent 该不该停」给出不同答案。代价是
+`run()` 不能在有事件循环的线程里调用，这种情况它会直接报错并指向 `arun`。
+
+**2. 同步实现也要挪到线程池。** provider 只实现 `generate` 完全可以，`arun`
+会把它丢进线程池；同步工具同理。否则一个 `time.sleep(0.05)` 的工具就能让
+整个事件循环停摆 —— 这类 bug 在单元测试里看不见，因为它「功能正常，只是慢」。
+
+**3. 测试要能证明「真的没阻塞」。** 光断言「await 能跑通」毫无意义，一个在
+async 函数里写 `time.sleep` 的实现照样能过。所以测试用**时间线断言**：慢 IO
+在跑的时候，另一个协程必须先完成。
+
+```bash
+python examples/async_demo.py   # 结果一致性 / 并发加速 / 慢工具不卡循环
+```
+
+| 同步入口 | 异步入口 | 说明 |
+| --- | --- | --- |
+| `agent.run()` | `agent.arun()` | 同一个循环，同一份结果 |
+| — | `agent.astream()` | 事件级流式；`arun` 就是把它抽干 |
+| `graph.invoke()` | `graph.ainvoke()` | 节点可以是 `async def` |
+| `graph.resume()` | `graph.aresume()` | 断点续跑同样支持异步节点 |
+| `registry.invoke()` | `registry.ainvoke()` | 异步工具在这里被 await |
+| `provider.generate()` | `provider.agenerate()` | 可选；不实现也能跑 |
+
+### 流式：事件级，不是 token 级
+
+```python
+async for item in agent.astream("还有多少茶杯?"):
+    if isinstance(item, AgentResult):
+        print("done:", item.answer)
+        continue
+    print(item.type, item.payload)   # agent.start / llm.call / tool.call / tool.result ...
+```
+
+**它不假装流 token。** 把已完成的答案切片吐出来，演示很好看，生产里用户照样
+要等完整回答才见到第一个字。真 token 流需要一个能产出 delta 的 provider 契约
+（增量拼装 `tool_calls` 是最麻烦的一段），那是独立一块工作；落地时它接进同一个
+循环，只多一个事件类型。
+
+三条契约，都是会踩坑的地方：
+
+- **事件顺序与 `result.trace` 完全一致** —— 边看边流和跑完再看不会给出两套事实
+- **最后一项一定是 `AgentResult`**，消费方靠 `isinstance` 收尾
+- **中途 `break` 等于取消**：生成器关闭，这一轮不写记忆（半途而废的问答不该变成记忆）
+
+背压是真的：事件直接产出，不经过无界队列。消费得慢，agent 就跟着慢 —— 否则
+一个卡住的 SSE 客户端能把内存吃满。
+
+```bash
+python examples/stream_demo.py   # 事件时间线 / 慢模型 / 中途放弃 / SSE 形状
+```
+
+---
+
 ## 核心设计
 
 ### 控制流
@@ -277,7 +362,7 @@ result.error      # "ValueError: kaboom"
 ## 测试与质量门禁
 
 ```bash
-pytest                                            # 319 个测试，全部离线
+pytest                                            # 365 个测试，全部离线
 pytest --cov=nexus_agents --cov-report=term-missing
 ruff check src tests examples
 mypy src/nexus_agents
@@ -285,8 +370,8 @@ mypy src/nexus_agents
 
 当前状态：
 
-- **319 passed**，平均耗时 ~2 秒（无网络、无 API Key、无 sleep）
-- 覆盖率 **97%**（`memory.py`、`graph.py`、`checkpoint.py`、`agent.py`、`types.py`、`tracing.py` 均 100%）
+- **365 passed**，平均耗时 ~2 秒（无网络、无 API Key、无真实等待）
+- 覆盖率 **97%**（`agent.py`、`graph.py`、`memory.py`、`checkpoint.py`、`types.py`、`tracing.py` 均 100%）
 - `ruff` 与 `mypy` 零告警
 
 测试替身是 `ScriptedProvider`：可以回放固定响应，也可以传一个函数按请求动态决定返回什么 —— 这样连「模型看到工具结果后怎么反应」都能精确断言。
@@ -314,12 +399,14 @@ nexus-agents/
 │       ├── base.py        GenerateRequest / LLMResponse / LLMProvider 协议
 │       ├── scripted.py    确定性测试替身
 │       └── openai_compat.py  OpenAI 兼容 HTTP 后端
-├── tests/                 319 个单元测试
+├── tests/                 365 个单元测试
 ├── examples/
 │   ├── quickstart.py      单 Agent 端到端示例（离线）
 │   ├── graph_demo.py      循环 / 条件边 / checkpoint / Mermaid
 │   ├── multiagent.py      supervisor + worker 多智能体
-│   └── memory_demo.py     上下文裁剪 / 摘要压缩 / 中文长期记忆
+│   ├── memory_demo.py     上下文裁剪 / 摘要压缩 / 中文长期记忆
+│   ├── async_demo.py      同步/异步一致性 / 并发 / 不阻塞事件循环
+│   └── stream_demo.py     事件时间线 / 慢模型 / 中途放弃 / SSE 形状
 └── docs/architecture.md   设计说明
 ```
 
@@ -330,9 +417,10 @@ nexus-agents/
 - [x] v0.1.0 消息模型、工具层、ReAct 循环、Provider 抽象、追踪
 - [x] v0.2.0 状态图编排（`StateGraph`）：条件边、循环、checkpoint，支撑多智能体
 - [x] v0.3.0 记忆层：token 预算裁剪（工具调用原子性）、摘要压缩、BM25-lite 长期记忆
-- [ ] v0.4.0 FastAPI 服务层：SSE 流式输出、会话持久化
-- [ ] v0.5.0 RAG 模块：切分、向量检索、重排、评测集
-- [ ] v0.6.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
+- [x] v0.4.0 异步运行时：`arun` / `ainvoke` / `aresume`，同步与异步共用同一控制流；含事件级流式 `astream`
+- [ ] v0.5.0 FastAPI 服务层：SSE（建在 `astream` 之上）、会话持久化、多会话隔离
+- [ ] v0.6.0 RAG 模块：切分、向量检索、重排、评测集
+- [ ] v0.7.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
 
 ---
 

@@ -26,6 +26,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -447,6 +449,21 @@ class CompiledGraph:
             path=(),
         )
 
+    async def ainvoke(
+        self,
+        initial_state: Mapping[str, Any] | None = None,
+        *,
+        thread_id: str | None = None,
+    ) -> GraphResult:
+        """Async version of :meth:`invoke`; async nodes are awaited in place."""
+        return await self._arun(
+            dict(initial_state or {}),
+            self._entry,
+            thread_id=thread_id or _new_thread_id(),
+            start_step=0,
+            path=(),
+        )
+
     def resume(self, thread_id: str) -> GraphResult:
         """Continue a run from its latest checkpoint.
 
@@ -468,6 +485,23 @@ class CompiledGraph:
             path=(),
         )
 
+    async def aresume(self, thread_id: str) -> GraphResult:
+        """Async version of :meth:`resume`."""
+        if self._checkpointer is None:
+            raise CheckpointError(
+                "This graph has no checkpointer; compile(..., checkpointer=...) first."
+            )
+        snapshot = self._checkpointer.load(thread_id)
+        if snapshot is None:
+            raise ThreadNotFoundError(thread_id)
+        return await self._arun(
+            dict(snapshot.state),
+            snapshot.node,
+            thread_id=thread_id,
+            start_step=snapshot.step,
+            path=(),
+        )
+
     def get_state(self, thread_id: str) -> Checkpoint | None:
         """Latest stored checkpoint for a thread, if any."""
         if self._checkpointer is None:
@@ -477,6 +511,33 @@ class CompiledGraph:
     # ------------------------------------------------------------ 内部
 
     def _run(
+        self,
+        state: dict[str, Any],
+        current: str | None,
+        *,
+        thread_id: str,
+        start_step: int,
+        path: tuple[str, ...],
+    ) -> GraphResult:
+        """Sync driver over the one async core (see ``_arun``)."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self._arun(
+                    state,
+                    current,
+                    thread_id=thread_id,
+                    start_step=start_step,
+                    path=path,
+                )
+            )
+        raise RuntimeError(
+            "invoke() cannot be called from a running event loop; "
+            "use `await graph.ainvoke(...)` instead."
+        )
+
+    async def _arun(
         self,
         state: dict[str, Any],
         current: str | None,
@@ -515,7 +576,7 @@ class CompiledGraph:
             try:
                 # 节点只拿到只读视图：想直接改状态会当场 TypeError
                 with tracer.span(EventType.NODE_START, step=steps, node=current):
-                    update = node_fn(frozen_view(state))
+                    update = await self._call_node(node_fn, state)
                 state = apply_update(state, update, self._reducers)
             except Exception as exc:
                 exception = exc
@@ -557,6 +618,20 @@ class CompiledGraph:
             exception=exception,
         )
 
+    async def _call_node(self, fn: NodeFn, state: Mapping[str, Any]) -> StateUpdate:
+        """Invoke one node, awaiting coroutine nodes.
+
+        同步节点也进线程池：图里挂一个阻塞 IO 的节点（读文件、调一次同步 SDK）
+        就够让 ``ainvoke`` 的并发全部失效，而这类节点恰恰最常见。
+        """
+        view = frozen_view(state)
+        if inspect.iscoroutinefunction(fn):
+            return await fn(view)
+        result = await asyncio.to_thread(fn, view)
+        if inspect.isawaitable(result):  # 被装饰器包过的 async 节点
+            return await result
+        return result
+
     def _route(
         self,
         source: str,
@@ -569,6 +644,16 @@ class CompiledGraph:
         if branch is not None:
             router, mapping = branch
             key = router(frozen_view(state))
+            if inspect.isawaitable(key):
+                # router 在同步上下文中被调用，await 不了。与其让 coroutine 对象
+                # 变成路由键触发一个莫名其妙的 InvalidRouteError，不如直接说清原因。
+                close = getattr(key, "close", None)
+                if callable(close):
+                    close()
+                raise GraphError(
+                    f"Branch function for node {source!r} returned an awaitable; "
+                    "conditional edges must be synchronous pure functions."
+                )
             if mapping and key in mapping:
                 target = mapping[key]
             elif key == END or key in self._nodes:
