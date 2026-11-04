@@ -14,6 +14,8 @@ The contract of a tool in nexus-agents
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import inspect
 import json
 import typing
@@ -60,6 +62,18 @@ def stringify_result(value: Any) -> str:
         return str(value)
 
 
+def _discard_awaitable(value: Any) -> None:
+    """Close an un-awaited coroutine so Python does not warn about it.
+
+    同步路径拿到 awaitable 说明调用方走错了门；那条 coroutine 永远不会被
+    await，留着只会让 GC 阶段冒一条 "never awaited" 警告盖住真正的错误。
+    """
+    close = getattr(value, "close", None)
+    if callable(close):
+        with contextlib.suppress(Exception):  # pragma: no cover - 关闭失败不影响主流程
+            close()
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """An immutable, validated description of one callable tool."""
@@ -80,6 +94,15 @@ class ToolSpec:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Keep decorated functions directly callable (nice for tests)."""
         return self.fn(*args, **kwargs)
+
+    @property
+    def is_async(self) -> bool:
+        """Whether the underlying function must be awaited.
+
+        判断依据是函数本身，而不是「调用后拿到什么」：后者要跑一遍才知道，
+        而这里需要在校验参数之前就决定走哪条执行路径。
+        """
+        return inspect.iscoroutinefunction(self.fn)
 
     # ------------------------------------------------------------ 校验
 
@@ -134,19 +157,75 @@ class ToolSpec:
         永远不会被一个坏工具打断。
         """
         call = call or ToolCall(id="", name=self.name, arguments=arguments)
-        try:
-            kwargs = self.validate_arguments(call.arguments)
-        except InvalidToolArguments as exc:
-            return ToolResult.failure(call_id=call.id, name=self.name, error=str(exc))
+        kwargs, failure = self._prepare(call)
+        if failure is not None:
+            return failure
+        if self.is_async:
+            # 同步路径里拿不到 await 的机会。与其偷偷 asyncio.run（在已有
+            # 事件循环里会直接炸），不如明确告诉调用方换哪条路。
+            return ToolResult.failure(
+                call_id=call.id,
+                name=self.name,
+                error=(
+                    f"tool {self.name!r} is async; use ainvoke() "
+                    "or run the agent with arun()"
+                ),
+            )
 
         try:
             value = self.fn(**kwargs)
         except Exception as exc:
+            return self._error(call, exc)
+        if inspect.isawaitable(value):
+            _discard_awaitable(value)
             return ToolResult.failure(
-                call_id=call.id, name=self.name, error=f"{type(exc).__name__}: {exc}"
+                call_id=call.id,
+                name=self.name,
+                error=f"tool {self.name!r} returned an awaitable; use ainvoke()",
             )
         return ToolResult(
             tool_call_id=call.id, name=self.name, output=stringify_result(value)
+        )
+
+    async def ainvoke(
+        self, call: ToolCall | None = None, **arguments: Any
+    ) -> ToolResult:
+        """Async counterpart of :meth:`invoke`.
+
+        同步函数会被丢到线程池执行，而不是就地调用：工具经常在做网络或磁盘
+        IO，就地调用会把整个事件循环卡住 —— 那是「异步接口」最典型的假货。
+        """
+        call = call or ToolCall(id="", name=self.name, arguments=arguments)
+        kwargs, failure = self._prepare(call)
+        if failure is not None:
+            return failure
+
+        try:
+            if self.is_async:
+                value = await self.fn(**kwargs)
+            else:
+                value = await asyncio.to_thread(self.fn, **kwargs)
+            if inspect.isawaitable(value):
+                # 被装饰器包过的 async 函数：is_async 漏判，但结果仍是 awaitable
+                value = await value
+        except Exception as exc:
+            return self._error(call, exc)
+        return ToolResult(
+            tool_call_id=call.id, name=self.name, output=stringify_result(value)
+        )
+
+    def _prepare(self, call: ToolCall) -> tuple[dict[str, Any], ToolResult | None]:
+        """Validate arguments once, for both the sync and async paths."""
+        try:
+            return self.validate_arguments(call.arguments), None
+        except InvalidToolArguments as exc:
+            return {}, ToolResult.failure(
+                call_id=call.id, name=self.name, error=str(exc)
+            )
+
+    def _error(self, call: ToolCall, exc: Exception) -> ToolResult:
+        return ToolResult.failure(
+            call_id=call.id, name=self.name, error=f"{type(exc).__name__}: {exc}"
         )
 
     # ------------------------------------------------------------ 对外格式
@@ -284,6 +363,14 @@ class ToolRegistry:
         except ToolNotFoundError as exc:
             return ToolResult.failure(call_id=call.id, name=call.name, error=str(exc))
         return spec.invoke(call)
+
+    async def ainvoke(self, call: ToolCall) -> ToolResult:
+        """Async dispatch; the agent's async loop goes through here."""
+        try:
+            spec = self.get(call.name)
+        except ToolNotFoundError as exc:
+            return ToolResult.failure(call_id=call.id, name=call.name, error=str(exc))
+        return await spec.ainvoke(call)
 
     def to_api_payload(self) -> list[dict[str, Any]]:
         return [spec.to_api_payload() for spec in self._tools.values()]

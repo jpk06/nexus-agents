@@ -70,6 +70,18 @@ class ScriptedProvider:
 
     def generate(self, request: GenerateRequest) -> LLMResponse:
         self.requests.append(request)
+        return self._replay(request)
+
+    async def agenerate(self, request: GenerateRequest) -> LLMResponse:
+        """Async replay.
+
+        本身没有 IO 可等待，但仍然实现 —— 否则 ``arun`` 会把整个测试替身丢进
+        线程池，异步路径（并发、取消、异常传播）就永远测不到了。
+        """
+        self.requests.append(request)
+        return self._replay(request)
+
+    def _replay(self, request: GenerateRequest) -> LLMResponse:
         item = self._next_item()
 
         if callable(item):

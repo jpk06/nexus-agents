@@ -12,10 +12,22 @@ Why serial tool execution
 Parallel tool calls look faster but make traces non-deterministic and error
 handling much harder. Serial is the right default; a parallel strategy can
 be added later behind the same interface.
+
+Why one async core, not two loops
+---------------------------------
+``arun`` holds the real loop; ``run`` is a thin driver that executes it with
+``asyncio.run``. The alternative — a sync copy and an async copy — drifts
+within a week: someone fixes a stop condition in one and forgets the other,
+and the two paths silently disagree about what the agent does.
+
+The cost of this choice is explicit: ``run`` cannot be called from a thread
+that already has a running event loop (that is what ``arun`` is for).
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -148,6 +160,32 @@ class ReActAgent:
 
         例外只有一处刻意为之：传入 ``memory`` 时，这一轮问答应在跑完后写回
         长期记忆 —— 记忆本来就是跨运行的副作用，藏起来反而更难推理。
+
+        实现上只是 ``asyncio.run(arun(...))``：真正跑循环的是 :meth:`arun`。
+        在已有事件循环的线程里调用会抛 ``RuntimeError`` —— 这种情况应当
+        ``await agent.arun(...)``，而不是让同步版本去猜怎么抢 loop。
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun(user_input, system=system, memory=memory))
+        raise RuntimeError(
+            "run() cannot be called from a running event loop; "
+            "use `await agent.arun(...)` instead."
+        )
+
+    async def arun(
+        self,
+        user_input: str,
+        *,
+        system: str | None = None,
+        memory: ConversationMemory | None = None,
+    ) -> AgentResult:
+        """Async version of :meth:`run`. Same loop, same result type.
+
+        与同步版本唯一的语义差别在 IO 的等待方式：provider 有原生 ``agenerate``
+        就直接 await，没有则放进线程池；工具走 ``ToolRegistry.ainvoke``，
+        async 工具并行等待、同步工具同样进线程池。控制流本身一行都没有分叉。
         """
         config = self.config
         tracer = Tracer()
@@ -198,7 +236,7 @@ class ReActAgent:
             )
 
             with tracer.span(EventType.LLM_CALL, step=step, message_count=len(messages)):
-                response: LLMResponse = self.provider.generate(request)
+                response: LLMResponse = await self._generate(request)
             usage = usage + response.usage
 
             assistant_msg = response.message
@@ -224,7 +262,7 @@ class ReActAgent:
                     tool=call.name,
                     arguments=call.arguments,
                 )
-                result = self.registry.invoke(call)
+                result = await self.registry.ainvoke(call)
                 tracer.emit(
                     EventType.TOOL_RESULT,
                     step=step,
@@ -279,6 +317,19 @@ class ReActAgent:
             usage=usage,
             trace=tuple(tracer.events),
         )
+
+    # ------------------------------------------------------------ 内部
+
+    async def _generate(self, request: GenerateRequest) -> LLMResponse:
+        """One model call, preferring a native async path when available."""
+        agenerate = getattr(self.provider, "agenerate", None)
+        if callable(agenerate):
+            result = agenerate(request)
+            if inspect.isawaitable(result):
+                return await result
+        # 同步 provider：进线程池。就地调用会占住事件循环，
+        # 一个 30 秒的模型请求足以让整个服务失去响应。
+        return await asyncio.to_thread(self.provider.generate, request)
 
 
 def _last_assistant_text(messages: list[Message]) -> str:

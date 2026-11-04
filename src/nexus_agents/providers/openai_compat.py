@@ -11,6 +11,7 @@ logged, never included in exception messages, and never written into traces.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Any
@@ -57,6 +58,7 @@ class OpenAICompatibleProvider:
         api_key: str | None = None,
         api_key_env: str = "OPENAI_API_KEY",
         client: httpx.Client | None = None,
+        async_client: httpx.AsyncClient | None = None,
         timeout: float = 60.0,
         max_retries: int = 2,
         backoff_base: float = 0.5,
@@ -65,33 +67,49 @@ class OpenAICompatibleProvider:
         self.model = model
         self._max_retries = max(0, max_retries)
         self._backoff_base = backoff_base
+        self._timeout = timeout
         self._base_url = (
             base_url or os.environ.get("OPENAI_BASE_URL") or DEFAULT_BASE_URL
         ).rstrip("/")
+
+        resolved_key = api_key or os.environ.get(api_key_env)
+        headers: dict[str, str] = {}
+        if resolved_key:
+            headers["Authorization"] = f"Bearer {resolved_key}"
+        if extra_headers:
+            headers.update(extra_headers)
+        # 存下来给异步客户端复用：两个客户端必须发一模一样的请求头，
+        # 否则「同步能跑、异步 401」这种问题极难查
+        self._headers = headers
 
         if client is not None:
             # 依赖注入：测试用 MockTransport，生产用真实连接
             self._client = client
             self._owns_client = False
         else:
-            resolved_key = api_key or os.environ.get(api_key_env)
             if not resolved_key and self._base_url == DEFAULT_BASE_URL:
                 raise MissingCredentialsError(api_key_env)
-            headers: dict[str, str] = {}
-            if resolved_key:
-                headers["Authorization"] = f"Bearer {resolved_key}"
-            if extra_headers:
-                headers.update(extra_headers)
             self._client = httpx.Client(
                 base_url=self._base_url, timeout=timeout, headers=headers
             )
             self._owns_client = True
+
+        # 异步客户端按需懒建：只调同步接口的调用方不该为一个 AsyncClient 买单
+        self._async_client = async_client
+        self._owns_async_client = False
 
     # ------------------------------------------------------------ 生命周期
 
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
+
+    async def aclose(self) -> None:
+        """Release the async client, if one was created."""
+        if self._owns_async_client and self._async_client is not None:
+            await self._async_client.aclose()
+            self._async_client = None
+            self._owns_async_client = False
 
     def __enter__(self) -> OpenAICompatibleProvider:
         return self
@@ -141,6 +159,65 @@ class OpenAICompatibleProvider:
 
     def _sleep(self, attempt: int) -> None:
         time.sleep(self._backoff_base * (2**attempt))
+
+    async def _async_sleep(self, attempt: int) -> None:
+        # 必须用 asyncio.sleep：这里阻塞的是事件循环，不是某一条线程
+        await asyncio.sleep(self._backoff_base * (2**attempt))
+
+    # ------------------------------------------------------------ 异步请求
+
+    def _ensure_async_client(self) -> httpx.AsyncClient:
+        if self._async_client is None:
+            self._async_client = httpx.AsyncClient(
+                base_url=self._base_url, timeout=self._timeout, headers=self._headers
+            )
+            self._owns_async_client = True
+        return self._async_client
+
+    async def agenerate(self, request: GenerateRequest) -> LLMResponse:
+        """Async counterpart of :meth:`generate`.
+
+        重试策略、payload、解析逻辑与同步版本完全一致 —— 只有等待方式不同。
+        两套实现各写一份重试逻辑是异步 SDK 最常见的分叉来源：改了同步版本
+        忘了异步版本，线上就出现「同步自动重试、异步直接失败」的怪事。
+        """
+        payload = self._build_payload(request)
+        client = self._ensure_async_client()
+        last_error: Exception | None = None
+
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = await client.post("/chat/completions", json=payload)
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt >= self._max_retries:
+                    raise ProviderTransportError(
+                        f"Request to {self._base_url} failed: {type(exc).__name__}"
+                    ) from exc
+                await self._async_sleep(attempt)
+                continue
+
+            if response.status_code in _RETRYABLE_STATUS and attempt < self._max_retries:
+                last_error = None
+                await self._async_sleep(attempt)
+                continue
+
+            if response.status_code >= 400:
+                raise ProviderTransportError(
+                    f"HTTP {response.status_code} from chat-completions endpoint: "
+                    f"{_safe_snippet(response.text)}"
+                )
+
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise ProviderResponseError("Response body is not valid JSON") from exc
+
+            return self._parse(data)
+
+        raise ProviderTransportError(
+            f"Exhausted {self._max_retries} retries without success"
+        ) from last_error
 
     def _build_payload(self, request: GenerateRequest) -> dict[str, Any]:
         payload: dict[str, Any] = {

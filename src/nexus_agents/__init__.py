@@ -82,6 +82,7 @@ from .memory import (
     render_transcript,
     tokenize,
 )
+from .providers.base import AsyncLLMProvider, LLMProvider, supports_async
 from .schema import annotation_to_json_schema, build_parameters_schema, parse_docstring
 from .tools import ToolRegistry, ToolSpec, build_tool_spec, tool
 from .tracing import EventType, TraceEvent, Tracer
@@ -98,7 +99,7 @@ from .types import (
     user_message,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     # agent
@@ -140,6 +141,10 @@ __all__ = [
     "estimate_message_tokens",
     "render_transcript",
     "tokenize",
+    # providers
+    "AsyncLLMProvider",
+    "LLMProvider",
+    "supports_async",
     # tools
     "ToolRegistry",
     "ToolSpec",

@@ -12,7 +12,13 @@ from typing import Any, Protocol, runtime_checkable
 from ..tools import ToolSpec
 from ..types import FinishReason, Message, Usage
 
-__all__ = ["GenerateRequest", "LLMResponse", "LLMProvider"]
+__all__ = [
+    "GenerateRequest",
+    "LLMResponse",
+    "LLMProvider",
+    "AsyncLLMProvider",
+    "supports_async",
+]
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,28 @@ class LLMResponse:
 
 @runtime_checkable
 class LLMProvider(Protocol):
-    """Minimal interface every backend must satisfy."""
+    """Minimal interface every backend must satisfy.
+
+    异步是**可选能力**，不是第二条必选契约：只实现 ``generate`` 的 provider
+    仍然完全合法，``ReActAgent.arun`` 会把它放进线程池调用。这样第三方实现
+    不必为了兼容异步而改一圈，异步收益却仍然拿得到 —— 只是拿不到「真异步」
+    （并发请求、流式响应）那一部分。
+    """
 
     def generate(self, request: GenerateRequest) -> LLMResponse: ...
+
+
+@runtime_checkable
+class AsyncLLMProvider(Protocol):
+    """A backend that can be awaited directly.
+
+    实现它的 provider 在 ``arun`` 下不会被丢进线程池，因此一次 agent 运行
+    里可以有多个请求真正并发（异步工具、并行分支都靠这一点）。
+    """
+
+    async def agenerate(self, request: GenerateRequest) -> LLMResponse: ...
+
+
+def supports_async(provider: object) -> bool:
+    """Whether ``provider`` exposes a usable native async entry point."""
+    return callable(getattr(provider, "agenerate", None))
