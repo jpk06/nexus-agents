@@ -25,7 +25,7 @@ Quick start
 
 from __future__ import annotations
 
-from .agent import AgentConfig, AgentResult, ReActAgent, Stopped
+from .agent import AgentConfig, AgentResult, AgentStreamItem, ReActAgent, Stopped
 from .checkpoint import Checkpoint, Checkpointer, InMemoryCheckpointer
 from .errors import (
     AgentError,
@@ -105,6 +105,7 @@ __all__ = [
     # agent
     "AgentConfig",
     "AgentResult",
+    "AgentStreamItem",
     "ReActAgent",
     "Stopped",
     # graph

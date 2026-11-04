@@ -22,16 +22,31 @@ and the two paths silently disagree about what the agent does.
 
 The cost of this choice is explicit: ``run`` cannot be called from a thread
 that already has a running event loop (that is what ``arun`` is for).
+
+Why stream events, not tokens
+-----------------------------
+``astream`` yields what the loop actually knows: step boundaries, tool calls,
+tool results, the final answer. It does **not** fake token streaming by
+slicing the finished answer into characters — that looks impressive in a demo
+and is worthless in production, because the user still waits for the whole
+response before the first "token" appears.
+
+Real token streaming needs a provider contract that emits deltas
+(``AsyncIterator[str]`` plus incremental tool-call assembly). That is a
+separate, provider-specific job; when it lands it plugs into the same loop and
+adds one more event type. Until then, an SSE endpoint built on ``astream``
+gives live progress — "calling search", "search returned 12 rows" — with no
+lying about latency.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, TypeAlias
 
 from .errors import AgentError, MaxStepsExceeded
 from .memory import ContextPolicy, ConversationMemory
@@ -40,7 +55,7 @@ from .tools import ToolRegistry, ToolSpec
 from .tracing import EventType, TraceEvent, Tracer
 from .types import Message, Usage, system_message, tool_result_message, user_message
 
-__all__ = ["AgentConfig", "Stopped", "AgentResult", "ReActAgent"]
+__all__ = ["AgentConfig", "Stopped", "AgentResult", "AgentStreamItem", "ReActAgent"]
 
 
 class Stopped(str, Enum):
@@ -117,6 +132,12 @@ class AgentResult:
         }
 
 
+#: 流里的一项：运行期间发生的 ``TraceEvent``，**最后**一项是 ``AgentResult``。
+#: 复用事件类型而不是另造一套「流式事件」，是因为两者描述的是同一件事 ——
+#: 多一套类型只会多一份要同步维护的映射。
+AgentStreamItem: TypeAlias = TraceEvent | AgentResult
+
+
 class ReActAgent:
     """A single agent: one provider, one tool set, one loop."""
 
@@ -186,7 +207,58 @@ class ReActAgent:
         与同步版本唯一的语义差别在 IO 的等待方式：provider 有原生 ``agenerate``
         就直接 await，没有则放进线程池；工具走 ``ToolRegistry.ainvoke``，
         async 工具并行等待、同步工具同样进线程池。控制流本身一行都没有分叉。
+
+        实现上是「把 :meth:`astream` 抽干，取最后一项」—— 这样「跑完」与
+        「边跑边看」用的是同一段代码，不存在两份可能分叉的循环。
         """
+        result: AgentResult | None = None
+        async for item in self._run_stream(user_input, system=system, memory=memory):
+            if isinstance(item, AgentResult):
+                result = item
+        return _require_result(result)
+
+    async def astream(
+        self,
+        user_input: str,
+        *,
+        system: str | None = None,
+        memory: ConversationMemory | None = None,
+    ) -> AsyncIterator[AgentStreamItem]:
+        """Run the loop, yielding each event as it happens.
+
+        消费方式（最后一项一定是 ``AgentResult``）::
+
+            final = None
+            async for item in agent.astream("查一下库存"):
+                if isinstance(item, AgentResult):
+                    final = item
+                else:
+                    print(item.type, item.payload)
+
+        三条契约，都是能踩坑的地方：
+
+        1. **最后一项必定是结果**。事件顺序与 ``result.trace`` 完全一致，
+           所以「边看边流」和「跑完再看」不会给出两套事实。
+        2. **中途放弃 = 取消**。``break`` 之后生成器被关闭，这一轮的记忆
+           写回不会发生 —— 半途而废的问答不该被当成记忆。
+        3. **背压是真的**：事件直接产出，不经过无界队列。消费得慢，agent
+           就跟着慢。这是刻意的，否则一个卡住的 SSE 客户端会把内存吃满。
+
+        注意 ``llm.call`` 事件在调用**发起时**就发出，因此它被消费时
+        ``duration_ms`` 还是 ``None``（要靠后面的 ``llm.response`` 才知道
+        花了多久）。这正是进度条需要的信息：先告诉你在等，再告诉你等了多久。
+        """
+        async for item in self._run_stream(user_input, system=system, memory=memory):
+            yield item
+
+    async def _run_stream(
+        self,
+        user_input: str,
+        *,
+        system: str | None,
+        memory: ConversationMemory | None,
+    ) -> AsyncIterator[AgentStreamItem]:
+        """The one and only control flow. ``arun`` drains it, ``astream`` relays it."""
         config = self.config
         tracer = Tracer()
         messages: list[Message] = []
@@ -198,7 +270,7 @@ class ReActAgent:
         messages.extend(recalled)
         messages.append(user_message(user_input))
 
-        tracer.emit(
+        yield tracer.emit(
             EventType.AGENT_START,
             input=user_input,
             tools=list(self.registry.names),
@@ -206,7 +278,7 @@ class ReActAgent:
             recalled=len(recalled),
         )
         if recalled:
-            tracer.emit(EventType.MEMORY_RECALL, count=len(recalled))
+            yield tracer.emit(EventType.MEMORY_RECALL, count=len(recalled))
 
         usage = Usage()
         step = 0
@@ -225,7 +297,7 @@ class ReActAgent:
                 context = config.context_policy.apply(tuple(messages))
                 request_messages = context.messages
                 if context.stats.dropped or context.stats.had_summary:
-                    tracer.emit(
+                    yield tracer.emit(
                         EventType.CONTEXT_TRIMMED, step=step, **context.stats.to_dict()
                     )
             request = GenerateRequest(
@@ -235,13 +307,16 @@ class ReActAgent:
                 max_tokens=config.max_tokens,
             )
 
-            with tracer.span(EventType.LLM_CALL, step=step, message_count=len(messages)):
+            with tracer.span(
+                EventType.LLM_CALL, step=step, message_count=len(messages)
+            ) as call_event:
+                yield call_event
                 response: LLMResponse = await self._generate(request)
             usage = usage + response.usage
 
             assistant_msg = response.message
             messages.append(assistant_msg)
-            tracer.emit(
+            yield tracer.emit(
                 EventType.LLM_RESPONSE,
                 step=step,
                 finish_reason=response.finish_reason.value,
@@ -256,14 +331,14 @@ class ReActAgent:
                 break
 
             for call in assistant_msg.tool_calls:
-                tracer.emit(
+                yield tracer.emit(
                     EventType.TOOL_CALL,
                     step=step,
                     tool=call.name,
                     arguments=call.arguments,
                 )
                 result = await self.registry.ainvoke(call)
-                tracer.emit(
+                yield tracer.emit(
                     EventType.TOOL_RESULT,
                     step=step,
                     tool=call.name,
@@ -283,7 +358,7 @@ class ReActAgent:
                     or consecutive_errors >= config.max_consecutive_errors
                 ):
                     stopped = Stopped.TOOL_ERROR
-                    tracer.emit(
+                    yield tracer.emit(
                         EventType.ERROR,
                         step=step,
                         tool=call.name,
@@ -297,9 +372,9 @@ class ReActAgent:
             # while 条件耗尽（不是 break）=> 真的跑满了步数
             stopped = Stopped.MAX_STEPS
             answer = _last_assistant_text(messages)
-            tracer.emit(EventType.MAX_STEPS, step=step, max_steps=config.max_steps)
+            yield tracer.emit(EventType.MAX_STEPS, step=step, max_steps=config.max_steps)
 
-        tracer.emit(
+        yield tracer.emit(
             EventType.AGENT_END,
             step=step,
             stopped_reason=stopped.value,
@@ -309,7 +384,7 @@ class ReActAgent:
         if memory is not None and answer:
             memory.remember_turn(user_input, answer, tags=(self.name,))
 
-        return AgentResult(
+        yield AgentResult(
             answer=answer,
             stopped_reason=stopped,
             steps=step,
@@ -337,3 +412,14 @@ def _last_assistant_text(messages: list[Message]) -> str:
         if message.role.value == "assistant" and message.content:
             return message.content
     return ""
+
+
+def _require_result(result: AgentResult | None) -> AgentResult:
+    """Narrow ``AgentResult | None`` — and fail loudly if the contract broke.
+
+    ``_run_stream`` 的最后一项一定是结果。这里不做 ``assert``：隐藏契约一旦
+    被后来的改动破坏，调用方需要的是一条能看懂的错，而不是半个 ``None``。
+    """
+    if result is None:
+        raise AgentError("agent stream ended without a result")
+    return result
