@@ -75,3 +75,4 @@ jobs:
           python examples/multiagent.py
           python examples/memory_demo.py
           python examples/async_demo.py
+          python examples/stream_demo.py
