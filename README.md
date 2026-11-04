@@ -1,5 +1,9 @@
 # nexus-agents
 
+[![CI](https://github.com/jpk06/nexus-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/jpk06/nexus-agents/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 一个**小到能一口气读完、但足够工程化**的 LLM Agent 运行时。
 
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
