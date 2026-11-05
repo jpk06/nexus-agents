@@ -16,6 +16,11 @@ schema.py   types.py  ←── 所有层共享，依赖最稳定
 
 checkpoint.py ── 只被 graph.py 依赖（存储契约，可替换）
 memory.py ── 只被 agent.py 依赖（上下文与长期记忆，不反向依赖）
+
+service/（可选依赖层，不参与核心分层）
+    app.py ── 只向下依赖：agent.py / memory.py / errors.py / tracing.py
+    sessions.py ── 只依赖 memory.py + types.py
+    sse.py ── 零依赖（纯函数）
 ```
 
 依赖**单向向下**：上层可以用下层，下层永远不知道上层存在。
@@ -237,6 +242,29 @@ tool(c2)                        ┘
 镇陶 / 陶瓷）。不需要词典，召回明显好于单字，排序仍然是确定的 —— 测试可以断言
 「哪条排第一」，而不是断言「大概能找到」。
 
+### `service/` —— HTTP 层（可选）
+
+这一层不参与核心分层，因为它**不是所有使用者都需要**：只想跑 Agent 循环的人
+不该被迫装 FastAPI。所以它放在独立子包里，从 `nexus_agents.service` 导入，
+FastAPI 写成 `[api]` extra。
+
+三个文件各管一件事：
+
+- `sse.py`：把事件编码成 `event: / data:` 帧。纯函数，因此多行 payload、
+  非法事件名、注释心跳这些边界都能一行断言钉死。
+- `sessions.py`：`Session`（memory + messages + lock）+ `SessionStore` 协议 +
+  TTL/LRU 内存实现。**历史和记忆是两件事**：历史负责「接得上」，记忆负责
+  「想得起」；只给 memory 的聊天服务第二句就失忆。
+- `app.py`：`create_app(agent)` 工厂 + 路由 + SSE 生成器。
+
+两条最容易写错的实现细节，都写在代码注释里也写在这里：
+
+1. **心跳不能取消正在等的那次拉取。** `asyncio.wait_for(anext(...))` 超时会取消
+   `anext`，等于往 agent 生成器里扔 `CancelledError` —— 心跳一跳整轮推理就死了。
+   正确做法是 `asyncio.wait` 只等「结果到没到」，超时发注释行，同一个 task 挂着。
+2. **取消要等落地。** `task.cancel()` 只是登记，不 await 就释放锁，下一轮可能
+   和还没停的旧推理并行跑。收尾顺序必须是：cancel → await → aclose → 放锁。
+
 ### `tracing.py` —— 事件流
 
 扁平的事件列表，不引入 OpenTelemetry。
@@ -270,6 +298,13 @@ tool(c2)                        ┘
 | 流的载体 | 复用 `TraceEvent` | 新造流式事件类型 | 两套类型意味着两套要同步维护的语义 |
 | 流背压 | 同步产出 | 无界队列 | 卡住的消费者会把内存吃满 |
 | 中断的流 | 不写记忆 | 照常写 | 半途而废的问答进记忆，下次召回就是幻觉素材 |
+| HTTP 装配 | `create_app(agent)` 工厂 | 模块级 `app` 单例 | 单例在 import 时就固定依赖，测试只能 monkeypatch |
+| SSE 方法 | POST + `text/event-stream` | `EventSource` 的 GET | GET 不能带请求体与自定义头，长文本还得塞进 URL |
+| 流内错误 | `error` 帧 | 试图改状态码 | 第一个字节发出后状态码已定死，改不了 |
+| 同会话并发 | 409 拒绝 | 排队 | 无上限排队是内存放大器；交错的两轮会把记忆写乱 |
+| 会话过期 | monotonic 时钟 | `time.time()` | 系统时间会被校正/回拨，回拨一次就永不过期 |
+| 会话容量 | TTL + LRU 上限 | 无上限 dict | 无上限的内存会话就是缓慢的内存泄漏 |
+| 输入校验 | `extra="forbid"` | 静默忽略未知字段 | 静默忽略会把「参数没生效」变成线上排查 |
 
 ## 已知限制
 
@@ -283,3 +318,9 @@ tool(c2)                        ┘
 - 检索是关键词式：同义词和改写查询召回不到（要语义检索得上 v0.6.0 的 RAG）
 - 摘要不保证事实无损：压缩比高时细节会丢，关键约束应显式写进 system prompt
 - 只支持 function-calling 风格的工具调用，不支持从纯文本里解析 ReAct 格式
+- 会话只在进程内存里：单机多副本部署会串话（同一会话落到不同 pod 就找不到），
+  上生产要把 `SessionStore` 换成 Redis，并用粘性会话或共享存储
+- 服务层没有真正的鉴权：`X-API-Key` 只是一道共享密钥闸门，没有用户、没有权限模型
+- `POST /messages` 不是幂等的：客户端重试就是第二次真的调用模型。幂等键留到接入
+  真实业务（订单/库存）时再做，那里才有必要
+- SSE 没有断线重连：没实现 `Last-Event-ID` 回放，断线只能整轮重来
