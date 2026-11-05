@@ -374,6 +374,29 @@ python examples/service_demo.py   # 进程内跑完整条链路，不需要端�
 
 ---
 
+## 性能基准
+
+`benchmarks/benchmark.py` 全程离线：用可控延迟的 provider 和阻塞工具替代真实
+LLM，测的是**运行时自身**的开销（调度、线程池分派、会话锁、SSE 帧编码）。
+基准自带护栏断言 —— 「工具参数写错导致校验阶段 0ms 失败」这类静默 bug 会让
+数字变小变漂亮，护栏直接把它拦下来。
+
+本机实测（Python 3.13.14 / Windows 11 / 16 核，2026-11-05，每轮 = 2 次模型调用
++ 1 次工具调用）：
+
+| 指标 | 数值 |
+| --- | --- |
+| 每轮框架开销（provider 立即返回） | P50 **0.10 ms** / P99 0.31 ms |
+| 10 轮并发 vs 串行（每轮约 185ms，含阻塞工具） | **9.96x**，并发墙钟 ≈ 单轮 |
+| `astream` 首帧延迟（provider 延迟 80ms） | **< 0.1 ms**（不用等整轮就能画进度条） |
+| HTTP 一轮往返（进程内 ASGI，含会话/历史/锁） | P50 **1.3 ms** / P99 3.3 ms |
+| HTTP 10 会话并发 vs 串行 | **9.42x**（会话锁只锁同一会话，不锁别人） |
+
+复现：`python benchmarks/benchmark.py`（约 8 秒，无 API Key、无网络、无端口）。
+数字测的是框架不是模型 —— 真实部署的延迟大头永远是 LLM 本身。
+
+---
+
 ## 核心设计
 
 ### 控制流
@@ -474,6 +497,8 @@ nexus-agents/
 │   ├── async_demo.py      同步/异步一致性 / 并发 / 不阻塞事件循环
 │   ├── stream_demo.py     事件时间线 / 慢模型 / 中途放弃 / SSE 形状
 │   └── service_demo.py    HTTP 层：会话 / SSE / 409 / 会话视图
+├── benchmarks/
+│   └── benchmark.py       离线性能基准（开销 / 并发 / 首帧 / HTTP 层）
 └── docs/architecture.md   设计说明
 ```
 

@@ -36,7 +36,7 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: ruff
-        run: ruff check src tests examples
+        run: ruff check src tests examples benchmarks
 
       - name: mypy
         run: mypy src/nexus_agents
@@ -77,3 +77,8 @@ jobs:
           python examples/async_demo.py
           python examples/stream_demo.py
           python examples/service_demo.py
+
+      # 基准也离线跑：跑的不是绝对数字（共享 runner 上没意义），而是
+      # 确认脚本没有悄悄坏掉 —— 护栏断言会拦住「数字变漂亮但全是假的」
+      - name: benchmarks run offline
+        run: python benchmarks/benchmark.py
