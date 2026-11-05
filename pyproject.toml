@@ -4,13 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-agents"
-version = "0.4.0"
+version = "0.5.0"
 description = "A small, explicit and fully testable runtime for LLM agents and multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Jiang Longhuan", email = "2513459544@qq.com" }]
-keywords = ["llm", "agent", "react", "tools", "function-calling", "multi-agent"]
+keywords = [
+    "llm",
+    "agent",
+    "react",
+    "tools",
+    "function-calling",
+    "multi-agent",
+    "fastapi",
+    "sse",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,12 +35,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 可选依赖分层：核心运行时只依赖 pydantic + httpx，想用 HTTP 层才装 fastapi。
+api = [
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
     "ruff>=0.5",
     "mypy>=1.10",
+    # 测试要覆盖 HTTP 层，所以 dev 里必须有它 —— CI 只装 .[dev]
+    "fastapi>=0.110",
 ]
 
 [project.urls]
