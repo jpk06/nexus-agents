@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, TypeAlias
@@ -173,6 +173,7 @@ class ReActAgent:
         *,
         system: str | None = None,
         memory: ConversationMemory | None = None,
+        history: Sequence[Message] | None = None,
     ) -> AgentResult:
         """Run the loop to completion and return a full :class:`AgentResult`.
 
@@ -189,7 +190,9 @@ class ReActAgent:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.arun(user_input, system=system, memory=memory))
+            return asyncio.run(
+                self.arun(user_input, system=system, memory=memory, history=history)
+            )
         raise RuntimeError(
             "run() cannot be called from a running event loop; "
             "use `await agent.arun(...)` instead."
@@ -201,6 +204,7 @@ class ReActAgent:
         *,
         system: str | None = None,
         memory: ConversationMemory | None = None,
+        history: Sequence[Message] | None = None,
     ) -> AgentResult:
         """Async version of :meth:`run`. Same loop, same result type.
 
@@ -212,7 +216,9 @@ class ReActAgent:
         「边跑边看」用的是同一段代码，不存在两份可能分叉的循环。
         """
         result: AgentResult | None = None
-        async for item in self._run_stream(user_input, system=system, memory=memory):
+        async for item in self._run_stream(
+            user_input, system=system, memory=memory, history=history
+        ):
             if isinstance(item, AgentResult):
                 result = item
         return _require_result(result)
@@ -223,7 +229,8 @@ class ReActAgent:
         *,
         system: str | None = None,
         memory: ConversationMemory | None = None,
-    ) -> AsyncIterator[AgentStreamItem]:
+        history: Sequence[Message] | None = None,
+    ) -> AsyncGenerator[AgentStreamItem, None]:
         """Run the loop, yielding each event as it happens.
 
         消费方式（最后一项一定是 ``AgentResult``）::
@@ -248,7 +255,9 @@ class ReActAgent:
         ``duration_ms`` 还是 ``None``（要靠后面的 ``llm.response`` 才知道
         花了多久）。这正是进度条需要的信息：先告诉你在等，再告诉你等了多久。
         """
-        async for item in self._run_stream(user_input, system=system, memory=memory):
+        async for item in self._run_stream(
+            user_input, system=system, memory=memory, history=history
+        ):
             yield item
 
     async def _run_stream(
@@ -257,7 +266,8 @@ class ReActAgent:
         *,
         system: str | None,
         memory: ConversationMemory | None,
-    ) -> AsyncIterator[AgentStreamItem]:
+        history: Sequence[Message] | None = None,
+    ) -> AsyncGenerator[AgentStreamItem, None]:
         """The one and only control flow. ``arun`` drains it, ``astream`` relays it."""
         config = self.config
         tracer = Tracer()
@@ -268,6 +278,12 @@ class ReActAgent:
         if prompt:
             messages.append(system_message(prompt))
         messages.extend(recalled)
+        # history 是「逐字照搬的最近若干轮」，和 memory 的「相关性召回」是两种
+        # 不同机制：聊天要的是时序连续（「那它呢」也接得上主语），检索要的是
+        # 跨会话命中（去年的同类问题也能被翻出来）。只有 memory 没有 history
+        # 的聊天服务，第二句就失忆 —— 这正是 HTTP 层需要的补丁。
+        if history:
+            messages.extend(history)
         messages.append(user_message(user_input))
 
         yield tracer.emit(
