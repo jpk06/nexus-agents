@@ -48,6 +48,7 @@
 | 异步运行时 | `arun` / `ainvoke` / `aresume` 全套异步入口；同步与异步共用**同一份控制流**，不会各修各的 |
 | 不阻塞 | 同步 provider 与同步工具自动进线程池；一个 `time.sleep` 的工具不会让整个服务失去响应 |
 | 事件流式 | `agent.astream()` 边跑边产出事件（工具调用、结果、耗时），最后一项是完整结果；SSE 有真东西可推，不是攒完再切片 |
+| HTTP 服务 | `create_app(agent)` 出一个会话级 API：SSE 流式 + 心跳、同会话串行（忙则 409）、TTL/LRU 会话存储、可选 API Key |
 
 ---
 
@@ -57,9 +58,13 @@
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
+
+# 想跑 HTTP 服务层再加：
+pip install -e ".[api]"
 ```
 
-需要 Python 3.11+。
+需要 Python 3.11+。核心运行时只依赖 `pydantic` + `httpx`；FastAPI 是**可选**依赖，
+不会因为「只想用 Agent 循环」就被迫装一整套 web 框架。
 
 ---
 
@@ -312,6 +317,86 @@ python examples/stream_demo.py   # 事件时间线 / 慢模型 / 中途放弃 / 
 
 ---
 
+## HTTP 服务层
+
+```python
+# app.py —— 装配和定义分开：路由不认识你的 provider
+import os
+
+from nexus_agents import ReActAgent
+from nexus_agents.providers import OpenAICompatibleProvider
+from nexus_agents.service import ServiceSettings, create_app
+
+agent = ReActAgent(OpenAICompatibleProvider(model="gpt-4o-mini"), tools=[])
+app = create_app(agent, settings=ServiceSettings(api_key=os.environ["SERVICE_KEY"]))
+```
+
+```bash
+pip install -e ".[api]"
+uvicorn app:app --reload
+curl -s localhost:8000/healthz
+curl -sN -X POST localhost:8000/sessions/$SID/messages/stream \
+  -H 'Content-Type: application/json' -d '{"text":"还有多少茶杯?"}'
+```
+
+| 路由 | 作用 |
+| --- | --- |
+| `GET /healthz` | 存活探针，不碰模型也不碰存储（探针不能自己变成故障点） |
+| `POST /sessions` | 建会话，可带会话级 `system` |
+| `GET /sessions/{id}` | 这一会话说过什么、聊了几轮（审计用） |
+| `POST /sessions/{id}/messages` | 跑一轮，返回完整 `AgentResult`（含 messages 与 trace） |
+| `POST /sessions/{id}/messages/stream` | 同一轮，SSE 逐事件推送 |
+| `DELETE /sessions/{id}` | 结束会话 |
+
+四个不显然但要紧的决定：
+
+- **SSE 走 POST。** 浏览器原生 `EventSource` 只能 GET、不能带请求体，也不能加鉴权头；
+  把问题塞进查询串既难看又有长度上限。所以用 POST + `text/event-stream`，客户端用
+  `fetch` 读流。代价是浏览器端要自己解析帧（十几行），收益是请求体和鉴权头都能用。
+- **错误分两层暴露。** 流一开始，状态码就定了 —— 上游模型中途挂掉，你**没法**把 200
+  改成 502，只能补一个 `error` 帧。所以 JSON 路径映射状态码（上游故障 502），SSE 路径
+  把错误发进流里；不区分就会出现「客户端收到 200 + 半截答案还以为成功了」。
+- **心跳不取消正在等的那次拉取。** `asyncio.wait_for(anext(...))` 超时会取消 `anext`，
+  等于往 agent 的生成器里扔 `CancelledError` —— 心跳一跳，整轮推理就死了。这里用
+  `asyncio.wait` 只等「结果到没到」，超时发一行 `: keep-alive`，同一个 task 继续挂着；
+  任何时刻只有一个未完成的拉取，背压依然真实。
+- **同一会话并发 = 409，不排队。** 两轮交错会把记忆写乱；而无上限的排队就是内存放大器
+  （一个人狂点发送，服务替他攒下几百个待跑的模型调用）。409 让客户端立刻知道「上一个
+  还没回」，这是更诚实的背压。
+
+会话状态就在 `Session` 里：`memory`（跨会话召回）、`messages`（逐字历史）、`lock`
+（串行化）。**历史和记忆是两件事** —— 历史负责「接得上」（「那它呢」也有主语），
+记忆负责「想得起」（跨会话命中）。只有记忆的聊天服务，第二句就失忆。
+
+```bash
+python examples/service_demo.py   # 进程内跑完整条链路，不需要端口与网络
+```
+
+---
+
+## 性能基准
+
+`benchmarks/benchmark.py` 全程离线：用可控延迟的 provider 和阻塞工具替代真实
+LLM，测的是**运行时自身**的开销（调度、线程池分派、会话锁、SSE 帧编码）。
+基准自带护栏断言 —— 「工具参数写错导致校验阶段 0ms 失败」这类静默 bug 会让
+数字变小变漂亮，护栏直接把它拦下来。
+
+本机实测（Python 3.13.14 / Windows 11 / 16 核，2026-11-05，每轮 = 2 次模型调用
++ 1 次工具调用）：
+
+| 指标 | 数值 |
+| --- | --- |
+| 每轮框架开销（provider 立即返回） | P50 **0.10 ms** / P99 0.31 ms |
+| 10 轮并发 vs 串行（每轮约 185ms，含阻塞工具） | **9.96x**，并发墙钟 ≈ 单轮 |
+| `astream` 首帧延迟（provider 延迟 80ms） | **< 0.1 ms**（不用等整轮就能画进度条） |
+| HTTP 一轮往返（进程内 ASGI，含会话/历史/锁） | P50 **1.3 ms** / P99 3.3 ms |
+| HTTP 10 会话并发 vs 串行 | **9.42x**（会话锁只锁同一会话，不锁别人） |
+
+复现：`python benchmarks/benchmark.py`（约 8 秒，无 API Key、无网络、无端口）。
+数字测的是框架不是模型 —— 真实部署的延迟大头永远是 LLM 本身。
+
+---
+
 ## 核心设计
 
 ### 控制流
@@ -395,18 +480,25 @@ nexus-agents/
 │   ├── memory.py          token 估算 / 检索 / 上下文裁剪 / 摘要
 │   ├── checkpoint.py      Checkpoint / Checkpointer 协议 / 内存实现
 │   ├── graph.py           StateGraph：条件边、循环、reducer、编译与执行
+│   ├── service/           可选依赖层：HTTP 服务（FastAPI）
+│   │   ├── app.py         create_app 工厂 / 路由 / SSE 生成器
+│   │   ├── sessions.py    Session + 存储协议 + TTL/LRU 内存实现
+│   │   └── sse.py         SSE 帧编码（纯函数，好测）
 │   └── providers/
 │       ├── base.py        GenerateRequest / LLMResponse / LLMProvider 协议
 │       ├── scripted.py    确定性测试替身
 │       └── openai_compat.py  OpenAI 兼容 HTTP 后端
-├── tests/                 365 个单元测试
+├── tests/                 413 个单元测试
 ├── examples/
 │   ├── quickstart.py      单 Agent 端到端示例（离线）
 │   ├── graph_demo.py      循环 / 条件边 / checkpoint / Mermaid
 │   ├── multiagent.py      supervisor + worker 多智能体
 │   ├── memory_demo.py     上下文裁剪 / 摘要压缩 / 中文长期记忆
 │   ├── async_demo.py      同步/异步一致性 / 并发 / 不阻塞事件循环
-│   └── stream_demo.py     事件时间线 / 慢模型 / 中途放弃 / SSE 形状
+│   ├── stream_demo.py     事件时间线 / 慢模型 / 中途放弃 / SSE 形状
+│   └── service_demo.py    HTTP 层：会话 / SSE / 409 / 会话视图
+├── benchmarks/
+│   └── benchmark.py       离线性能基准（开销 / 并发 / 首帧 / HTTP 层）
 └── docs/architecture.md   设计说明
 ```
 
@@ -418,7 +510,7 @@ nexus-agents/
 - [x] v0.2.0 状态图编排（`StateGraph`）：条件边、循环、checkpoint，支撑多智能体
 - [x] v0.3.0 记忆层：token 预算裁剪（工具调用原子性）、摘要压缩、BM25-lite 长期记忆
 - [x] v0.4.0 异步运行时：`arun` / `ainvoke` / `aresume`，同步与异步共用同一控制流；含事件级流式 `astream`
-- [ ] v0.5.0 FastAPI 服务层：SSE（建在 `astream` 之上）、会话持久化、多会话隔离
+- [x] v0.5.0 FastAPI 服务层：SSE（建在 `astream` 之上，含心跳与取消）、会话级历史与隔离、TTL/LRU 存储
 - [ ] v0.6.0 RAG 模块：切分、向量检索、重排、评测集
 - [ ] v0.7.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
 
@@ -429,6 +521,8 @@ nexus-agents/
 - API Key 只从环境变量或显式参数读取，**不写进异常信息、日志或 trace**
 - 密钥相关的错误只提示缺哪个环境变量，不回显任何片段
 - 工具异常会被捕获成结构化结果，原始堆栈不会泄漏给模型
+- 服务层：未知字段一律 422（不静默忽略），输入有长度上限，错误帧只回显自家异常，
+  陌生异常的 message 绝不外泄；`X-API-Key` 用 `compare_digest` 比较
 
 ---
 

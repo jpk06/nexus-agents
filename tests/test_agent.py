@@ -6,9 +6,10 @@ import pytest
 
 from conftest import add, boom
 from nexus_agents import AgentConfig, AgentError, MaxStepsExceeded, ReActAgent, ToolRegistry
+from nexus_agents.memory import ConversationMemory
 from nexus_agents.providers import ScriptedProvider, tool_call_message
 from nexus_agents.tracing import EventType
-from nexus_agents.types import Message, Role, ToolCall, assistant_message
+from nexus_agents.types import Message, Role, ToolCall, assistant_message, user_message
 
 
 def echo_after_tool_call(tool_name: str, arguments: dict, answer: str):
@@ -265,3 +266,59 @@ def test_repr_shows_tools():
     agent = ReActAgent(ScriptedProvider([]), [add], name="calc")
     assert "calc" in repr(agent)
     assert "add" in repr(agent)
+
+
+# ---------------------------------------------------------------- history 注入
+
+
+def test_history_is_sent_between_system_prompt_and_new_question():
+    """逐字历史的位置必须固定：system → 历史 → 新问题。
+
+    位置错了不会报错，模型只会「看起来有点傻」—— 这种 bug 只能靠断言顺序
+    抓出来。
+    """
+    provider = ScriptedProvider(["第二个答案"])
+    agent = agent_with(provider)
+    history = [user_message("第一个问题"), assistant_message("第一个答案")]
+
+    agent.run(
+        "第二个问题",
+        system="你是库管",
+        history=history,
+    )
+
+    sent = provider.last_request.messages
+    assert [(m.role, m.content) for m in sent] == [
+        (Role.SYSTEM, "你是库管"),
+        (Role.USER, "第一个问题"),
+        (Role.ASSISTANT, "第一个答案"),
+        (Role.USER, "第二个问题"),
+    ]
+
+
+def test_history_and_memory_can_be_combined():
+    """历史负责「接得上」，记忆负责「想得起」—— 两者叠加而不是互相覆盖。"""
+    provider = ScriptedProvider(["答案"])
+    agent = agent_with(provider)
+    memory = ConversationMemory()
+    memory.remember_turn("去年的同类问题", "去年的答案")
+
+    agent.run(
+        "今年的同类问题",
+        memory=memory,
+        history=[user_message("刚才说了什么"), assistant_message("刚才的答案")],
+    )
+
+    sent = provider.last_request.messages
+    kinds = [m.role for m in sent]
+    # 先召回记忆（system），再逐字历史，最后是新问题
+    assert kinds == [Role.SYSTEM, Role.USER, Role.ASSISTANT, Role.USER]
+    assert "去年的答案" in sent[0].content
+    assert sent[1].content == "刚才说了什么"
+    assert sent[-1].content == "今年的同类问题"
+
+
+def test_history_defaults_to_nothing():
+    provider = ScriptedProvider(["答案"])
+    agent_with(provider).run("只有一个问题")
+    assert [m.role for m in provider.last_request.messages] == [Role.USER]

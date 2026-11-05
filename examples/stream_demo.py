@@ -7,9 +7,9 @@
 2. 工具调用与结果之间有真实间隔（这里是 60 ms 的假 IO）
 3. 中途 ``break`` 的流不会写记忆
 
-最后一段顺带把事件打成 SSE 的 ``data: ...`` 形状：v0.5.0 的 FastAPI 端点
-基本就是「for event in agent.astream(...): yield f'data: {json}'」，这里先
-把数据源跑通。
+最后一段顺带把事件打成 SSE 的 ``data: ...`` 形状 —— 真正的端点
+（``nexus_agents.service``）就是在这个形状上加了会话、心跳与取消，
+见 ``examples/service_demo.py``。
 """
 
 from __future__ import annotations
