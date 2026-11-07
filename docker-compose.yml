@@ -1,0 +1,62 @@
+# 一条命令跑起来：`docker compose up --build`
+#
+# 为什么不把密钥写进 environment 的字面量
+# --------------------------------------
+# 这个文件是**进版本库**的。写死密钥 = 永久泄露（Git 历史里删不掉）。
+# 下面的 `${VAR:-默认值}` 由 Compose 从同目录的 `.env` 或当前 shell 读取，
+# 而 `.env` 在 .gitignore 里。`.env.example` 只放变量名和说明。
+#
+# 为什么单副本、不做 scale
+# ------------------------
+# 会话状态（记忆 / 消息流水 / 串行锁）仍在进程内存里。`--scale api=2` 会让
+# 同一个 session_id 落到没有它的那个副本上，第二轮直接 404。要横向扩展，
+# 先把 SessionStore 换成 Redis/Postgres —— 这是下一步，不是今天。
+
+name: nexus-agents
+
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    image: nexus-agents:${NEXUS_TAG:-dev}
+
+    environment:
+      NEXUS_MODEL: ${NEXUS_MODEL:-gpt-4o-mini}
+      # 指向本地 vLLM / Ollama / LM Studio 时可以不设密钥
+      NEXUS_BASE_URL: ${NEXUS_BASE_URL:-}
+      NEXUS_API_KEY: ${NEXUS_API_KEY:-}
+      # 演示级的共享密钥闸门（请求头 X-API-Key）。留空 = 不校验。
+      NEXUS_SERVICE_KEY: ${NEXUS_SERVICE_KEY:-}
+      NEXUS_LOG_LEVEL: ${NEXUS_LOG_LEVEL:-info}
+      NEXUS_MAX_SESSIONS: ${NEXUS_MAX_SESSIONS:-1000}
+      NEXUS_SESSION_TTL: ${NEXUS_SESSION_TTL:-3600}
+      NEXUS_MAX_INPUT_CHARS: ${NEXUS_MAX_INPUT_CHARS:-8000}
+
+    ports:
+      # 只映射到宿主机回环，别默认把服务暴露到局域网
+      - "127.0.0.1:${NEXUS_HOST_PORT:-8000}:8000"
+
+    # 只读根文件系统 + 临时 /tmp：进程被拿下也写不进镜像
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+    # 比容器自带的 HEALTHCHECK 宽松一点：冷启动要建 provider，
+    # 给它 20 秒而不是 5 秒，否则健康检查会先把容器判死
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+    # 比应用内的 graceful_timeout(10s) 长，保证 SIGTERM 之后由应用先收尾
+    stop_grace_period: 15s
+    restart: unless-stopped

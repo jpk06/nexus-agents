@@ -34,7 +34,7 @@ import contextlib
 import logging
 import secrets
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
@@ -79,7 +79,9 @@ class ServiceSettings:
     history_messages: int = 40
     #: 可选共享密钥。设置后所有 /sessions 请求都要带 ``X-API-Key``。
     #: 这是演示级的闸门，不是身份认证 —— 生产环境请换成真正的鉴权。
-    api_key: str | None = None
+    #: ``repr=False``：``ServiceSettings`` 会被嵌进 ``RuntimeConfig`` 一起被
+    #: 打印（启动日志、崩溃回溯），带着密钥的 repr 等于把密钥写进日志。
+    api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_input_chars < 1:
