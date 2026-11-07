@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from .app import ServiceSettings, create_app
+from .builtin import BUILTIN_TOOLS, current_time
+from .runtime import EnvConfigError, RuntimeConfig, build_agent, parse_env
 from .sessions import InMemorySessionStore, Session, SessionStore
 from .sse import SSE_HEADERS, SSE_MEDIA_TYPE, encode_comment, encode_event
 
@@ -22,4 +24,11 @@ __all__ = [
     "SSE_MEDIA_TYPE",
     "encode_event",
     "encode_comment",
+    # 部署装配：环境变量 -> 对象
+    "RuntimeConfig",
+    "EnvConfigError",
+    "parse_env",
+    "build_agent",
+    "BUILTIN_TOOLS",
+    "current_time",
 ]
