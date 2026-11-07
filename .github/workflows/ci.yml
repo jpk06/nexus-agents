@@ -82,3 +82,73 @@ jobs:
       # 确认脚本没有悄悄坏掉 —— 护栏断言会拦住「数字变漂亮但全是假的」
       - name: benchmarks run offline
         run: python benchmarks/benchmark.py
+
+  # 镜像单独一个 job：它要 Docker daemon，而 lint/test 不需要。
+  # 放在同一个 workflow 里，PR 上就能回答「这个 Dockerfile 现在还构建得起来吗」，
+  # 而不是等部署那天才发现某一层早就坏了。
+  docker:
+    name: docker (build + smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --tag nexus-agents:ci .
+
+      # compose 文件是给人手敲的，最容易在改名改端口时腐烂；
+      # config 只解析不启动，几十毫秒就能拦住语法/插值错误
+      - name: Compose file is valid
+        run: docker compose config > /dev/null
+
+      - name: Image stays small
+        run: |
+          size=$(docker image inspect nexus-agents:ci --format '{{.Size}}')
+          echo "image size: $((size / 1024 / 1024)) MiB"
+          # 卡上限而不是下限：多阶段构建一旦漏拷 .venv 或构建工具链，
+          # 体积会翻几倍，而功能测试全绿 —— 只有这条能发现
+          test "$size" -lt 600000000
+
+      - name: Config resolves inside the image, with the key masked
+        run: |
+          out=$(docker run --rm -e NEXUS_API_KEY=sk-should-not-appear nexus-agents:ci \
+            python -m nexus_agents.service --check)
+          echo "$out"
+          # 密钥进日志等于泄露：这条断言直接盯住输出
+          if echo "$out" | grep -q "sk-should-not-appear"; then
+            echo "::error::the API key leaked into --check output"
+            exit 1
+          fi
+
+      - name: Container starts, serves and becomes healthy
+        run: |
+          docker run -d --name smoke -p 8123:8000 \
+            -e NEXUS_BASE_URL=http://127.0.0.1:9/v1 \
+            -e NEXUS_API_KEY=ci-dummy \
+            -e NEXUS_SERVICE_KEY=ci-gate \
+            nexus-agents:ci
+          for _ in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8123/healthz || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          test "$code" = "200" || { docker logs smoke; exit 1; }
+          curl -s http://127.0.0.1:8123/healthz
+
+      - name: Shared-secret gate rejects a request without the header
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:8123/sessions \
+            -H 'content-type: application/json' -d '{}')
+          echo "status without X-API-Key: $code"
+          test "$code" = "401"
+
+      - name: Container runs as a non-root user
+        run: test "$(docker exec smoke id -u)" != "0"
+
+      - name: Logs when something failed
+        if: failure()
+        run: docker logs smoke || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm -f smoke || true
