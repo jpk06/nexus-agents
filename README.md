@@ -9,7 +9,7 @@
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
 不依赖任何 Agent 框架，`pydantic` + `httpx` 就是全部运行时依赖。
 
-> 状态：v0.6.0，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署已可用，通过 448 个单元测试（97% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
+> 状态：v0.6.1，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署 + JSON 结构化日志与限流已可用，通过 497 个单元测试（98% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
 
 ---
 
@@ -375,13 +375,51 @@ python examples/service_demo.py   # 进程内跑完整条链路，不需要端�
 
 ---
 
+## 可观测性与限流（v0.6.1）
+
+**请求 ID 是贯穿一切的线索。** 客户端带了合法 `X-Request-ID` 就沿用，没有就生成
+一个（16 位 hex），并回写到响应头。访问日志、业务日志（provider 失败、流中断）
+都带上同一个 ID —— 用户报障时给一个 ID，就能从日志里捞出整条请求：
+
+```json
+{"ts":"2026-11-10T04:00:00.123456+00:00","level":"info","logger":"nexus_agents.service.access",
+ "event":"POST /sessions -> 201 in 1.2ms","request_id":"9f86d081884c47d4","method":"POST",
+ "path":"/sessions","status":201,"duration_ms":1.2}
+```
+
+**日志是 JSON Lines（一行一个对象）。** 人类可读文本对 grep 友好，对 ELK / Loki /
+CloudWatch 这类采集管道不友好 —— 管道里没有「哪一段是 session_id」的元数据。
+`NEXUS_LOG_JSON=true`（容器里推荐）开启；本地开发保持文本格式，`tail -f` 能读。
+异常折进 `exception` 字段而不是拼成多行 —— 一行日志永远是一行。
+
+**限流是每调用方一个令牌桶。** 容量 = 允许的瞬时突发，回填率 = 承诺的长期速率；
+固定窗口在边界处会放行两倍流量，令牌桶不会。调用方身份：有 `X-API-Key` 按密钥
+摘要（原文永不进内存表和日志），否则按客户端地址。超了 429：
+
+```bash
+$ curl -s -o /dev/null -w '%{http_code} %{header_json}\n' -X POST localhost:8000/sessions ...
+429 {"retry-after": ["1"]}
+{"detail":"rate limit exceeded; retry later"}
+```
+
+三个刻意的豁免与决定：
+
+- **`/healthz` 不限流也不记访问日志。** 编排器探针每几秒一打，吃业务配额会把健康
+  实例摘出负载均衡；全记进日志则日志量与在线时长成正比、与流量无关。
+- **限流默认关。** 本地开发不该被自己的测试请求限到；生产在 compose 里设
+  `NEXUS_RATE_LIMIT=120`（每分钟请求数）+ `NEXUS_RATE_LIMIT_BURST`（突发容量）。
+- **429 也进访问日志。** 中间件顺序刻意让日志层包住限流层 —— 限流器在线上挡了
+  多少请求、挡的是谁，必须能从日志查账，不能只靠它自己知道。
+
+---
+
 ## 部署（Docker）
 
 ```bash
 cp .env.example .env          # 填 NEXUS_API_KEY，或把 NEXUS_BASE_URL 指向本地模型
 docker compose up --build
 curl -s localhost:8000/healthz
-# {"status":"ok","version":"0.6.0","agent":"nexus-service","tools":["current_time"],"sessions":0}
+# {"status":"ok","version":"0.6.1","agent":"nexus-service","tools":["current_time"],"sessions":0}
 ```
 
 不用 compose 也行：
@@ -408,6 +446,9 @@ docker run --rm --env-file .env nexus-agents python -m nexus_agents.service --ch
 | `NEXUS_MAX_INPUT_CHARS` | 8000 | 单条输入长度上限（超了 413） |
 | `NEXUS_MAX_SESSIONS` / `NEXUS_SESSION_TTL` | 1000 / 3600 | 会话容量与空闲过期（秒） |
 | `NEXUS_HEARTBEAT` | 15 | SSE 心跳间隔（秒），必须小于反代空闲超时 |
+| `NEXUS_RATE_LIMIT` | 不设 | 每调用方每分钟请求数；不设 = 不限流 |
+| `NEXUS_RATE_LIMIT_BURST` | 10 | 令牌桶容量（允许的瞬时突发） |
+| `NEXUS_LOG_JSON` | false | `true` = JSON Lines 日志（容器/采集管道推荐） |
 | `NEXUS_LOG_LEVEL` / `NEXUS_PORT` | info / 8000 | 日志级别、容器内监听端口 |
 
 六个不显然的决定：
@@ -593,6 +634,7 @@ nexus-agents/
 - [x] v0.4.0 异步运行时：`arun` / `ainvoke` / `aresume`，同步与异步共用同一控制流；含事件级流式 `astream`
 - [x] v0.5.0 FastAPI 服务层：SSE（建在 `astream` 之上，含心跳与取消）、会话级历史与隔离、TTL/LRU 存储
 - [x] v0.6.0 容器化与部署：环境变量装配层、多阶段镜像、compose、健康探针、优雅停机、CI 镜像冒烟
+- [x] v0.6.1 可观测性与限流：JSON 结构化日志、`X-Request-ID` 贯穿访问/业务日志、每调用方令牌桶限流（429 + Retry-After）
 - [ ] v0.7.0 持久化会话存储：`SessionStore` 的 Redis / Postgres 实现（多 worker 的前置条件）
 - [ ] v0.8.0 RAG 模块：切分、向量检索、重排、评测集
 - [ ] v0.9.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`

@@ -248,7 +248,7 @@ tool(c2)                        ┘
 不该被迫装 FastAPI。所以它放在独立子包里，从 `nexus_agents.service` 导入，
 FastAPI 写成 `[api]` extra。
 
-三个文件各管一件事：
+五个文件各管一件事：
 
 - `sse.py`：把事件编码成 `event: / data:` 帧。纯函数，因此多行 payload、
   非法事件名、注释心跳这些边界都能一行断言钉死。
@@ -256,6 +256,13 @@ FastAPI 写成 `[api]` extra。
   TTL/LRU 内存实现。**历史和记忆是两件事**：历史负责「接得上」，记忆负责
   「想得起」；只给 memory 的聊天服务第二句就失忆。
 - `app.py`：`create_app(agent)` 工厂 + 路由 + SSE 生成器。
+- `observability.py`：`X-Request-ID` 中间件（纯 ASGI，不碰流式行为）+
+  JSON Lines Formatter。字段名是采集管道的对外契约，测试按「形状」钉死
+  （可解析、extras 透传、异常折字段、一行一行）。
+- `ratelimit.py`：`TokenBucket`（可注入时钟，确定性测试）+ `RateLimiter`
+  （密钥摘要做调用方身份，桶数量 LRU 封顶）+ 429 中间件。单进程内的原子性
+  靠「事件循环里 check 之间无 await」；多 worker 必须换 Redis 实现 ——
+  这里不假装支持。
 
 两条最容易写错的实现细节，都写在代码注释里也写在这里：
 
@@ -288,6 +295,8 @@ FastAPI 写成 `[api]` extra。
 | 运行身份 | 非 root(10001) + 只读根 + `no-new-privileges` | root + 可写 | 逃逸链第一步通常是拿 root 再落地文件 |
 | 健康检查 | Python 标准库探针 | 装 curl | 镜像里每多一个二进制就是一份漏洞面 |
 | 密钥 | 不进构建上下文、不进 repr、`--check` 只报「设置没设置」 | 打日志方便排查 | 日志会被贴进 issue，密钥一旦进去收不回来 |
+| 限流 | 每调用方令牌桶 + 429 + Retry-After，`/healthz` 豁免 | 固定窗口计数 | 窗口边界放行双倍流量；探针吃业务配额会把健康实例摘出负载均衡 |
+| 日志 | JSON Lines + 请求 ID 贯穿，中间件顺序保证 429 也在访问日志里 | 人类可读文本 | 采集管道按字段建索引；限流器干了什么必须能从日志查账 |
 
 ### `tracing.py` —— 事件流
 

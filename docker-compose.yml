@@ -29,6 +29,11 @@ services:
       # 演示级的共享密钥闸门（请求头 X-API-Key）。留空 = 不校验。
       NEXUS_SERVICE_KEY: ${NEXUS_SERVICE_KEY:-}
       NEXUS_LOG_LEVEL: ${NEXUS_LOG_LEVEL:-info}
+      # 容器里推荐 JSON Lines：采集管道（Loki/ELK/CloudWatch）按字段建索引
+      NEXUS_LOG_JSON: ${NEXUS_LOG_JSON:-true}
+      # 每调用方每分钟请求数；留空 = 不限流（本地开发默认关）
+      NEXUS_RATE_LIMIT: ${NEXUS_RATE_LIMIT:-}
+      NEXUS_RATE_LIMIT_BURST: ${NEXUS_RATE_LIMIT_BURST:-10}
       NEXUS_MAX_SESSIONS: ${NEXUS_MAX_SESSIONS:-1000}
       NEXUS_SESSION_TTL: ${NEXUS_SESSION_TTL:-3600}
       NEXUS_MAX_INPUT_CHARS: ${NEXUS_MAX_INPUT_CHARS:-8000}

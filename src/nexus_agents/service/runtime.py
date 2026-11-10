@@ -68,6 +68,9 @@ class RuntimeConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"
+    #: 日志走 JSON Lines 还是人类可读文本。容器/采集管道配 true（默认在
+    #: compose 里配），本地开发 tail -f 时留 false。
+    log_json: bool = False
     #: 收到 SIGTERM 后等待在途请求收尾的秒数。SSE 连接可能正开到一半，
     #: 直接掐断会让客户端看到一个「没有 error 帧的截断流」。
     graceful_timeout: int = 10
@@ -87,9 +90,12 @@ class RuntimeConfig:
                 f"heartbeat_seconds={self.service.heartbeat_seconds}",
                 f"history_messages={self.service.history_messages}",
                 f"service_key={'required' if self.service.api_key else 'open'}",
+                f"rate_limit={self.service.rate_limit_per_minute or 'disabled'}",
+                f"rate_limit_burst={self.service.rate_limit_burst}",
                 f"host={self.host}",
                 f"port={self.port}",
                 f"log_level={self.log_level}",
+                f"log_json={self.log_json}",
                 f"graceful_timeout={self.graceful_timeout}",
             ]
         )
@@ -168,6 +174,24 @@ def _optional_float(environ: Mapping[str, str], name: str) -> float | None:
         raise EnvConfigError(f"{name} must be a number, got {raw!r}") from None
 
 
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def _bool(environ: Mapping[str, str], name: str, default: bool) -> bool:
+    """布尔环境变量。不接受「随便什么非空串都算 true」—— 那会把拼写错误
+    （``NEXUS_LOG_JSON=tur``）静默变成 true，而这正是配置层最该拦截的错误。"""
+    raw = _text(environ, name)
+    if raw is None:
+        return default
+    lowered = raw.lower()
+    if lowered in _TRUE_WORDS:
+        return True
+    if lowered in _FALSE_WORDS:
+        return False
+    raise EnvConfigError(f"{name} must be true or false, got {raw!r}")
+
+
 # ================================================================ 解析
 
 
@@ -199,6 +223,12 @@ def parse_env(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
             f"NEXUS_LOG_LEVEL must be one of {', '.join(_LOG_LEVELS)}, got {log_level!r}"
         )
 
+    rate_limit = _optional_float(env, "NEXUS_RATE_LIMIT")
+    # 这里必须抛 EnvConfigError 而不是让 ServiceSettings 抛 ValueError：
+    # 进程入口只捕获前者（退出码 2 + 一行人话），后者会变成一段 traceback
+    if rate_limit is not None and rate_limit <= 0:
+        raise EnvConfigError(f"NEXUS_RATE_LIMIT must be > 0, got {rate_limit}")
+
     service = ServiceSettings(
         max_input_chars=_int(env, "NEXUS_MAX_INPUT_CHARS", 8000, minimum=1),
         max_sessions=_int(env, "NEXUS_MAX_SESSIONS", 1000, minimum=1),
@@ -208,6 +238,9 @@ def parse_env(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         heartbeat_seconds=_float(env, "NEXUS_HEARTBEAT", 15.0, exclusive_minimum=0.0),
         history_messages=_int(env, "NEXUS_HISTORY_MESSAGES", 40, minimum=0),
         api_key=_text(env, "NEXUS_SERVICE_KEY"),
+        # 限流默认关：本地开发不该被自己的测试请求限到；生产在 compose 里开
+        rate_limit_per_minute=rate_limit,
+        rate_limit_burst=_int(env, "NEXUS_RATE_LIMIT_BURST", 10, minimum=1),
     )
 
     agent = AgentConfig(
@@ -228,6 +261,7 @@ def parse_env(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         # 时，报错应该发生在解析阶段，而不是 bind() 的时候
         port=_int(env, "NEXUS_PORT", 8000, minimum=1, maximum=65535),
         log_level=log_level,
+        log_json=_bool(env, "NEXUS_LOG_JSON", default=False),
         graceful_timeout=_int(env, "NEXUS_GRACEFUL_TIMEOUT", 10, minimum=0),
     )
 

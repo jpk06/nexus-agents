@@ -22,6 +22,7 @@ from collections.abc import Sequence
 
 from ..errors import MissingCredentialsError
 from .app import create_app
+from .observability import configure_logging
 from .runtime import EnvConfigError, build_agent, parse_env
 
 
@@ -54,6 +55,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ModuleNotFoundError:  # pragma: no cover - 只在没装 api extra 时触发
         print('uvicorn is not installed: pip install "nexus-agents[api]"', file=sys.stderr)
         return 2
+
+    # 日志先于 uvicorn 配置好：进程自己的日志（配置告警、访问日志）从第一行
+    # 起就是选定的格式；uvicorn 自己的 access log 属于服务器，格式随它的配置
+    configure_logging(config.log_level, json_output=config.log_json)
 
     app = create_app(agent, settings=config.service)
     uvicorn.run(

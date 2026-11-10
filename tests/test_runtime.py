@@ -188,6 +188,57 @@ def test_service_key_becomes_the_gate() -> None:
     assert config.api_key == SECRET
 
 
+# ================================================================ 限流与日志开关
+
+
+def test_rate_limit_defaults_to_disabled() -> None:
+    assert parse_env(env()).service.rate_limit_per_minute is None
+    assert "rate_limit=disabled" in parse_env(env()).describe()
+
+
+def test_rate_limit_knobs_are_parsed() -> None:
+    config = parse_env(env(NEXUS_RATE_LIMIT="120", NEXUS_RATE_LIMIT_BURST="5"))
+
+    assert config.service.rate_limit_per_minute == pytest.approx(120.0)
+    assert config.service.rate_limit_burst == 5
+    assert "rate_limit=120.0" in config.describe()
+    assert "rate_limit_burst=5" in config.describe()
+
+
+def test_rate_limit_must_be_positive() -> None:
+    # 0 不是「全禁」的意思 —— 想全禁就别把服务起起来
+    with pytest.raises(EnvConfigError, match="NEXUS_RATE_LIMIT"):
+        parse_env(env(NEXUS_RATE_LIMIT="0"))
+    with pytest.raises(EnvConfigError, match="NEXUS_RATE_LIMIT"):
+        parse_env(env(NEXUS_RATE_LIMIT="fast"))
+
+
+def test_rate_limit_burst_must_be_at_least_one() -> None:
+    with pytest.raises(EnvConfigError, match="NEXUS_RATE_LIMIT_BURST"):
+        parse_env(env(NEXUS_RATE_LIMIT="60", NEXUS_RATE_LIMIT_BURST="0"))
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("true", True), ("FALSE", False), ("1", True), ("off", False)],
+)
+def test_log_json_accepts_the_usual_boolean_words(raw: str, expected: bool) -> None:
+    assert parse_env(env(NEXUS_LOG_JSON=raw)).log_json is expected
+
+
+def test_log_json_rejects_typos_instead_of_guessing() -> None:
+    """``NEXUS_LOG_JSON=tur`` 静默变 true 是最阴的配置错误，必须在解析期拦住。"""
+    with pytest.raises(EnvConfigError, match="NEXUS_LOG_JSON"):
+        parse_env(env(NEXUS_LOG_JSON="tur"))
+
+
+def test_log_json_defaults_to_human_readable() -> None:
+    config = parse_env(env())
+
+    assert config.log_json is False
+    assert "log_json=False" in config.describe()
+
+
 # ================================================================ 密钥不外泄
 
 
