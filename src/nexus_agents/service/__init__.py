@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from .app import ServiceSettings, create_app
 from .builtin import BUILTIN_TOOLS, current_time
+from .observability import JsonFormatter, RequestLoggingMiddleware, configure_logging
+from .ratelimit import RateLimiter, RateLimitMiddleware, TokenBucket
 from .runtime import EnvConfigError, RuntimeConfig, build_agent, parse_env
 from .sessions import InMemorySessionStore, Session, SessionStore
 from .sse import SSE_HEADERS, SSE_MEDIA_TYPE, encode_comment, encode_event
@@ -31,4 +33,11 @@ __all__ = [
     "build_agent",
     "BUILTIN_TOOLS",
     "current_time",
+    # 可观测性与限流
+    "JsonFormatter",
+    "RequestLoggingMiddleware",
+    "configure_logging",
+    "RateLimiter",
+    "RateLimitMiddleware",
+    "TokenBucket",
 ]

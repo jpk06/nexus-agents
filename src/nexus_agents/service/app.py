@@ -46,6 +46,8 @@ from ..agent import AgentResult, ReActAgent
 from ..errors import NexusError, ProviderError
 from ..memory import ConversationMemory
 from ..tracing import TraceEvent
+from .observability import RequestLoggingMiddleware, current_request_id
+from .ratelimit import RateLimiter, RateLimitMiddleware
 from .sessions import InMemorySessionStore, Session, SessionStore
 from .sse import SSE_HEADERS, SSE_MEDIA_TYPE, encode_comment, encode_event
 
@@ -82,6 +84,12 @@ class ServiceSettings:
     #: ``repr=False``：``ServiceSettings`` 会被嵌进 ``RuntimeConfig`` 一起被
     #: 打印（启动日志、崩溃回溯），带着密钥的 repr 等于把密钥写进日志。
     api_key: str | None = field(default=None, repr=False)
+    #: 每调用方每分钟允许的请求数。``None``（默认）= 不限流。0 不是「禁言」
+    #: 的意思 —— 想全禁就别把服务起起来，写 0 只会让配置的含义变模糊。
+    rate_limit_per_minute: float | None = None
+    #: 令牌桶容量（开启限流时的允许突发量）。桶满时一次可以连发这么多请求，
+    #: 之后回落到 ``rate_limit_per_minute`` 的匀速。
+    rate_limit_burst: int = 10
 
     def __post_init__(self) -> None:
         if self.max_input_chars < 1:
@@ -94,6 +102,10 @@ class ServiceSettings:
             raise ValueError("heartbeat_seconds must be > 0")
         if self.history_messages < 0:
             raise ValueError("history_messages must be >= 0")
+        if self.rate_limit_per_minute is not None and self.rate_limit_per_minute <= 0:
+            raise ValueError("rate_limit_per_minute must be > 0 when set")
+        if self.rate_limit_burst < 1:
+            raise ValueError("rate_limit_burst must be >= 1")
 
 
 # ================================================================ 请求/响应模型
@@ -256,6 +268,7 @@ async def delete_session(
 @sessions_router.post("/{session_id}/messages")
 async def send_message(
     body: SendMessageRequest,
+    request: Request,
     session: Session = Depends(require_session),
     agent: ReActAgent = Depends(get_agent),
     settings: ServiceSettings = Depends(get_settings),
@@ -276,10 +289,18 @@ async def send_message(
             )
         except ProviderError as exc:
             # 502：问题出在上游模型，不是这个服务的 bug
-            logger.warning("provider failed for session %s: %s", session.id, exc)
+            logger.warning(
+                "provider failed for session %s",
+                session.id,
+                extra={"request_id": current_request_id(request.scope), "session_id": session.id},
+            )
             raise HTTPException(status_code=502, detail="upstream model failed") from exc
         except NexusError as exc:
-            logger.exception("agent run failed for session %s", session.id)
+            logger.exception(
+                "agent run failed for session %s",
+                session.id,
+                extra={"request_id": current_request_id(request.scope), "session_id": session.id},
+            )
             raise HTTPException(status_code=500, detail="agent run failed") from exc
     session.record(result.messages)
     return result.to_dict()
@@ -288,6 +309,7 @@ async def send_message(
 @sessions_router.post("/{session_id}/messages/stream")
 async def stream_message(
     body: SendMessageRequest,
+    request: Request,
     session: Session = Depends(require_session),
     agent: ReActAgent = Depends(get_agent),
     settings: ServiceSettings = Depends(get_settings),
@@ -303,7 +325,13 @@ async def stream_message(
     # 这里 409 返回，也不会留下一个「拿着锁却没人消费」的生成器。
     # 反过来写就必须用 try/except 手工还锁 —— 少一条清理路径，少一类漏锁。
     response = StreamingResponse(
-        _frames(agent, session, body.text, settings),
+        _frames(
+            agent,
+            session,
+            body.text,
+            settings,
+            request_id=current_request_id(request.scope),
+        ),
         media_type=SSE_MEDIA_TYPE,
         headers=SSE_HEADERS,
     )
@@ -382,6 +410,7 @@ async def _frames(
     session: Session,
     text: str,
     settings: ServiceSettings,
+    request_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Turn ``agent.astream`` into SSE frames, with heartbeats and clean cancel.
 
@@ -419,7 +448,11 @@ async def _frames(
             # 注意 CancelledError 不会进这里：3.8 起它是 BaseException。
             # 取消就该一路往上抛，绝不能被「转成 error 帧」吞掉。
             except Exception as exc:  # 流一旦开始，错误只能就地转成事件
-                logger.exception("agent stream failed for session %s", session.id)
+                logger.exception(
+                    "agent stream failed for session %s",
+                    session.id,
+                    extra={"request_id": request_id, "session_id": session.id},
+                )
                 yield encode_event("error", _error_payload(exc))
                 return
 
@@ -480,6 +513,19 @@ def create_app(
         max_sessions=resolved.max_sessions,
         ttl_seconds=resolved.session_ttl_seconds,
     )
+    # 中间件顺序：Starlette 按「后加的在外层」堆栈式包住 app。先加限流、
+    # 再加访问日志 → 请求先穿过**日志层**再进限流层。被限流拒绝的 429 也会
+    # 经过日志层的 send 包装，出现在访问日志里 —— 否则限流器在线上干了什么
+    # （挡了多少请求、挡的是谁）只能靠它自己知道。
+    if resolved.rate_limit_per_minute is not None:
+        app.add_middleware(
+            RateLimitMiddleware,
+            limiter=RateLimiter(
+                requests_per_minute=resolved.rate_limit_per_minute,
+                burst=resolved.rate_limit_burst,
+            ),
+        )
+    app.add_middleware(RequestLoggingMiddleware)
     app.include_router(ops_router)
     app.include_router(sessions_router)
     return app
