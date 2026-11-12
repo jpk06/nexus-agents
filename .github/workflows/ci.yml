@@ -134,6 +134,13 @@ jobs:
           test "$code" = "200" || { docker logs smoke; exit 1; }
           curl -s http://127.0.0.1:8123/healthz
 
+      - name: Metrics endpoint serves Prometheus text format
+        run: |
+          body=$(curl -s http://127.0.0.1:8123/metrics)
+          echo "$body" | grep '^nexus_' | head -3
+          echo "$body" | grep -q '^# TYPE nexus_http_requests_total counter$'
+          echo "$body" | grep -q '^nexus_http_requests_in_flight 0$'
+
       - name: Shared-secret gate rejects a request without the header
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' \

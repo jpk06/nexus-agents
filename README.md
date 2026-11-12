@@ -9,7 +9,7 @@
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
 不依赖任何 Agent 框架，`pydantic` + `httpx` 就是全部运行时依赖。
 
-> 状态：v0.6.1，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署 + JSON 结构化日志与限流已可用，通过 497 个单元测试（98% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
+> 状态：v0.6.2，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署 + JSON 结构化日志 + 限流 + Prometheus 指标已可用，通过 514 个单元测试（98% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
 
 ---
 
@@ -375,7 +375,7 @@ python examples/service_demo.py   # 进程内跑完整条链路，不需要端�
 
 ---
 
-## 可观测性与限流（v0.6.1）
+## 可观测性与限流（v0.6.x）
 
 **请求 ID 是贯穿一切的线索。** 客户端带了合法 `X-Request-ID` 就沿用，没有就生成
 一个（16 位 hex），并回写到响应头。访问日志、业务日志（provider 失败、流中断）
@@ -411,6 +411,31 @@ $ curl -s -o /dev/null -w '%{http_code} %{header_json}\n' -X POST localhost:8000
 - **429 也进访问日志。** 中间件顺序刻意让日志层包住限流层 —— 限流器在线上挡了
   多少请求、挡的是谁，必须能从日志查账，不能只靠它自己知道。
 
+**指标是 Prometheus 文本格式，`/metrics` 直接抓。** 零依赖手写的注册表
+（~180 行，不引入 `prometheus_client` 的全局单例和后台线程）暴露三个指标：
+`nexus_http_requests_total{route,status}`（错误率）、
+`nexus_http_request_duration_seconds`（延迟直方图）、
+`nexus_http_requests_in_flight`（背压信号，含挂着的 SSE 长连接）：
+
+```bash
+$ curl -s localhost:8000/metrics | grep '^nexus_' | head -4
+nexus_http_requests_total{route="/sessions",status="201"} 2
+nexus_http_request_duration_seconds_bucket{route="/sessions",le="0.005"} 1
+nexus_http_request_duration_seconds_count{route="/sessions"} 2
+nexus_http_requests_in_flight 0
+```
+
+指标层的三个决定（都是「demo 没事、上线出事」的地方）：
+
+- **路由标签用模板（`/sessions/{session_id}/messages`），不用原始路径。**
+  UUID 进标签就是势爆炸：每个新会话一条时间序列，公网服务几小时打爆
+  Prometheus。没路由可用的请求（404，以及被限流层在路由前拒绝的 429）
+  折叠成 `<unmatched>` —— 有界，且照样能查 429 率。
+- **SSE 时长记到流结束，不在 `response.start` 掐表。** 在响应头发出那刻
+  记延迟，长连接全部变成微秒级 —— 指标说谎比没有指标更糟。
+- **单进程诚实计数。** 多 worker 各数各的，靠抓取侧 `sum by (instance)`
+  聚合；和限流器一样，这里不假装支持多副本共享。
+
 ---
 
 ## 部署（Docker）
@@ -419,7 +444,7 @@ $ curl -s -o /dev/null -w '%{http_code} %{header_json}\n' -X POST localhost:8000
 cp .env.example .env          # 填 NEXUS_API_KEY，或把 NEXUS_BASE_URL 指向本地模型
 docker compose up --build
 curl -s localhost:8000/healthz
-# {"status":"ok","version":"0.6.1","agent":"nexus-service","tools":["current_time"],"sessions":0}
+# {"status":"ok","version":"0.6.2","agent":"nexus-service","tools":["current_time"],"sessions":0}
 ```
 
 不用 compose 也行：
@@ -635,6 +660,7 @@ nexus-agents/
 - [x] v0.5.0 FastAPI 服务层：SSE（建在 `astream` 之上，含心跳与取消）、会话级历史与隔离、TTL/LRU 存储
 - [x] v0.6.0 容器化与部署：环境变量装配层、多阶段镜像、compose、健康探针、优雅停机、CI 镜像冒烟
 - [x] v0.6.1 可观测性与限流：JSON 结构化日志、`X-Request-ID` 贯穿访问/业务日志、每调用方令牌桶限流（429 + Retry-After）
+- [x] v0.6.2 Prometheus 指标：`/metrics` 文本格式、请求计数（路由模板标签）、延迟直方图、在途请求 gauge
 - [ ] v0.7.0 持久化会话存储：`SessionStore` 的 Redis / Postgres 实现（多 worker 的前置条件）
 - [ ] v0.8.0 RAG 模块：切分、向量检索、重排、评测集
 - [ ] v0.9.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
