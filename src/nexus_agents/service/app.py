@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .. import __version__
@@ -46,6 +46,7 @@ from ..agent import AgentResult, ReActAgent
 from ..errors import NexusError, ProviderError
 from ..memory import ConversationMemory
 from ..tracing import TraceEvent
+from .metrics import PROMETHEUS_CONTENT_TYPE, Metrics, MetricsMiddleware, render
 from .observability import RequestLoggingMiddleware, current_request_id
 from .ratelimit import RateLimiter, RateLimitMiddleware
 from .sessions import InMemorySessionStore, Session, SessionStore
@@ -231,6 +232,16 @@ async def healthz(
         "tools": list(agent.registry.names),
         "sessions": store.count(),
     }
+
+
+@ops_router.get("/metrics", response_class=PlainTextResponse)
+async def metrics_endpoint(request: Request) -> PlainTextResponse:
+    """Prometheus 文本格式。ops 面（和 /healthz 一样不设密钥闸门）——
+    指标里只有路由模板、状态码计数和延迟分布，没有会话内容；生产环境
+    把它留在内网（Compose 里不映射端口，或加网络策略），而不是在这里
+    引入一套演示项目撑不起来的鉴权体系。"""
+    registry = cast(Metrics, request.app.state.metrics)
+    return PlainTextResponse(render(registry), media_type=PROMETHEUS_CONTENT_TYPE)
 
 
 @sessions_router.post("", status_code=201, response_model=CreateSessionResponse)
@@ -526,6 +537,12 @@ def create_app(
             ),
         )
     app.add_middleware(RequestLoggingMiddleware)
+    # 指标层放在最外（最后 add）：被限流拒绝的 429、被日志层放行的一切
+    # 请求都计入 ``requests_total`` —— 错误率是「四类中间件合力」的结果，
+    # 从限流层里面数会天然低估。探针与 /metrics 自身已在指标层内部豁免。
+    metrics = Metrics()
+    app.state.metrics = metrics
+    app.add_middleware(MetricsMiddleware, metrics=metrics)
     app.include_router(ops_router)
     app.include_router(sessions_router)
     return app

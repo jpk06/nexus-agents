@@ -10,6 +10,13 @@ from __future__ import annotations
 
 from .app import ServiceSettings, create_app
 from .builtin import BUILTIN_TOOLS, current_time
+from .metrics import (
+    DEFAULT_BUCKETS,
+    PROMETHEUS_CONTENT_TYPE,
+    Metrics,
+    MetricsMiddleware,
+    render,
+)
 from .observability import JsonFormatter, RequestLoggingMiddleware, configure_logging
 from .ratelimit import RateLimiter, RateLimitMiddleware, TokenBucket
 from .runtime import EnvConfigError, RuntimeConfig, build_agent, parse_env
@@ -40,4 +47,9 @@ __all__ = [
     "RateLimiter",
     "RateLimitMiddleware",
     "TokenBucket",
+    "Metrics",
+    "MetricsMiddleware",
+    "render",
+    "PROMETHEUS_CONTENT_TYPE",
+    "DEFAULT_BUCKETS",
 ]
