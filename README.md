@@ -364,6 +364,10 @@ curl -sN -X POST localhost:8000/sessions/$SID/messages/stream \
 - **同一会话并发 = 409，不排队。** 两轮交错会把记忆写乱；而无上限的排队就是内存放大器
   （一个人狂点发送，服务替他攒下几百个待跑的模型调用）。409 让客户端立刻知道「上一个
   还没回」，这是更诚实的背压。
+- **客户端断开 = 取消，不是暂停。** 挂起的拉取被取消、生成器被 `aclose()`、本轮不写
+  记忆也不记历史（半途而废的问答不该污染会话）。断线后本轮作废，整轮重发；当前
+  **不支持续传**（`Last-Event-ID` 无处对账），v0.7 持久化后的正确形态是幂等重放。
+  详见 [docs/operations.md](docs/operations.md)。
 
 会话状态就在 `Session` 里：`memory`（跨会话召回）、`messages`（逐字历史）、`lock`
 （串行化）。**历史和记忆是两件事** —— 历史负责「接得上」（「那它呢」也有主语），
@@ -376,6 +380,9 @@ python examples/service_demo.py   # 进程内跑完整条链路，不需要端�
 ---
 
 ## 可观测性与限流（v0.6.x）
+
+> 本节是概览；完整版（SSE 断线语义、PromQL 告警查询、日志排障路径、环境变量
+> 全表、故障速查表）见 **[docs/operations.md](docs/operations.md)**。
 
 **请求 ID 是贯穿一切的线索。** 客户端带了合法 `X-Request-ID` 就沿用，没有就生成
 一个（16 位 hex），并回写到响应头。访问日志、业务日志（provider 失败、流中断）
@@ -454,7 +461,7 @@ docker build -t nexus-agents .
 docker run --rm -p 127.0.0.1:8000:8000 --env-file .env nexus-agents
 ```
 
-**上线前先验配置**（只读环境变量、打印解析结果、不启动服务器，退出码 2 = 配置错）：
+**上线前先验配置**（只读环境变量、打印解析结果、不启动服务器，退出码 2 = 配置错；完整变量表见 [docs/operations.md](docs/operations.md)）：
 
 ```bash
 docker run --rm --env-file .env nexus-agents python -m nexus_agents.service --check

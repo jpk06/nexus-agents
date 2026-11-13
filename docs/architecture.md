@@ -279,7 +279,9 @@ FastAPI 写成 `[api]` extra。
 ### 部署装配 —— `runtime.py` / `builtin.py` / `__main__.py`
 
 这一层解决的是「**让上面所有代码在别人的机器上跑起来**」，不是新能力。它被单独
-拆出来，是因为部署配置最容易在「本地好使、容器里崩」。
+拆出来，是因为部署配置最容易在「本地好使、容器里崩」。（运维视角的完整手册——
+SSE 断线语义、PromQL、日志排障、环境变量全表、故障速查——见
+[operations.md](operations.md)。）
 
 - `runtime.py`：`parse_env(mapping) -> RuntimeConfig` 是**纯函数**（不建客户端、
   不碰全局环境），`build_agent(config)` 才负责把配置变成对象。分开之后，
