@@ -248,7 +248,7 @@ tool(c2)                        ┘
 不该被迫装 FastAPI。所以它放在独立子包里，从 `nexus_agents.service` 导入，
 FastAPI 写成 `[api]` extra。
 
-三个文件各管一件事：
+五个文件各管一件事：
 
 - `sse.py`：把事件编码成 `event: / data:` 帧。纯函数，因此多行 payload、
   非法事件名、注释心跳这些边界都能一行断言钉死。
@@ -256,6 +256,17 @@ FastAPI 写成 `[api]` extra。
   TTL/LRU 内存实现。**历史和记忆是两件事**：历史负责「接得上」，记忆负责
   「想得起」；只给 memory 的聊天服务第二句就失忆。
 - `app.py`：`create_app(agent)` 工厂 + 路由 + SSE 生成器。
+- `observability.py`：`X-Request-ID` 中间件（纯 ASGI，不碰流式行为）+
+  JSON Lines Formatter。字段名是采集管道的对外契约，测试按「形状」钉死
+  （可解析、extras 透传、异常折字段、一行一行）。
+- `ratelimit.py`：`TokenBucket`（可注入时钟，确定性测试）+ `RateLimiter`
+  （密钥摘要做调用方身份，桶数量 LRU 封顶）+ 429 中间件。单进程内的原子性
+  靠「事件循环里 check 之间无 await」；多 worker 必须换 Redis 实现 ——
+  这里不假装支持。
+- `metrics.py`：零依赖的 Prometheus 文本注册表（counter / histogram /
+  gauge）+ 纯 ASGI 采集中间件 + `/metrics` 路由。路由标签用模板而非原始
+  路径（势必须有界），SSE 时长记到流结束（在 `response.start` 掐表会把
+  长连接记成微秒级）。指标层放在限流层外 —— 429 也计入错误率。
 
 两条最容易写错的实现细节，都写在代码注释里也写在这里：
 
@@ -264,6 +275,35 @@ FastAPI 写成 `[api]` extra。
    正确做法是 `asyncio.wait` 只等「结果到没到」，超时发注释行，同一个 task 挂着。
 2. **取消要等落地。** `task.cancel()` 只是登记，不 await 就释放锁，下一轮可能
    和还没停的旧推理并行跑。收尾顺序必须是：cancel → await → aclose → 放锁。
+
+### 部署装配 —— `runtime.py` / `builtin.py` / `__main__.py`
+
+这一层解决的是「**让上面所有代码在别人的机器上跑起来**」，不是新能力。它被单独
+拆出来，是因为部署配置最容易在「本地好使、容器里崩」。（运维视角的完整手册——
+SSE 断线语义、PromQL、日志排障、环境变量全表、故障速查——见
+[operations.md](operations.md)。）
+
+- `runtime.py`：`parse_env(mapping) -> RuntimeConfig` 是**纯函数**（不建客户端、
+  不碰全局环境），`build_agent(config)` 才负责把配置变成对象。分开之后，
+  「端口写错了会不会报错」这种问题用一次字典构造就能测，不需要起进程。
+- `builtin.py`：内置 `current_time` 工具。目的不是功能，而是让第一次 `curl`
+  就能在 SSE 流里看到 `tool.call` → `tool.result`，把「装配对不对」变成可观察事实。
+- `__main__.py`：`uvicorn` 懒导入（测试环境不装服务器也能跑 `--check`），
+  配置错误退出码 2，与「运行中失败(1)」区分。
+
+六条部署侧的取舍：
+
+| 决定 | 选了 | 没选 | 为什么 |
+| --- | --- | --- | --- |
+| 镜像结构 | 多阶段（builder 编 wheel → runtime 只装 wheel） | 单阶段 | 运行阶段没有构建链，体积 212 MB，少一类「构建期依赖泄漏到运行期」 |
+| 进程模型 | 单 worker | 多 worker / 多副本 | 会话状态在进程内，第二 worker 看到空会话表 → 用户第二句就 404 |
+| 配置错误 | 启动即失败（退出码 2） | 跑起来再说 | 编排器能把「立刻退出并打印原因」变成一次明确的部署失败 |
+| 运行身份 | 非 root(10001) + 只读根 + `no-new-privileges` | root + 可写 | 逃逸链第一步通常是拿 root 再落地文件 |
+| 健康检查 | Python 标准库探针 | 装 curl | 镜像里每多一个二进制就是一份漏洞面 |
+| 密钥 | 不进构建上下文、不进 repr、`--check` 只报「设置没设置」 | 打日志方便排查 | 日志会被贴进 issue，密钥一旦进去收不回来 |
+| 限流 | 每调用方令牌桶 + 429 + Retry-After，`/healthz` 豁免 | 固定窗口计数 | 窗口边界放行双倍流量；探针吃业务配额会把健康实例摘出负载均衡 |
+| 日志 | JSON Lines + 请求 ID 贯穿，中间件顺序保证 429 也在访问日志里 | 人类可读文本 | 采集管道按字段建索引；限流器干了什么必须能从日志查账 |
+| 指标 | 手写 ~180 行 Prometheus 文本格式，路由标签用模板 | `prometheus_client` | 核心仓库零运行时依赖；不引入全局 REGISTRY / 后台线程 / 进程收集器，行为完全可预测 |
 
 ### `tracing.py` —— 事件流
 
@@ -319,7 +359,10 @@ FastAPI 写成 `[api]` extra。
 - 摘要不保证事实无损：压缩比高时细节会丢，关键约束应显式写进 system prompt
 - 只支持 function-calling 风格的工具调用，不支持从纯文本里解析 ReAct 格式
 - 会话只在进程内存里：单机多副本部署会串话（同一会话落到不同 pod 就找不到），
-  上生产要把 `SessionStore` 换成 Redis，并用粘性会话或共享存储
+  所以镜像**刻意只用单 worker**；上生产要把 `SessionStore` 换成 Redis，并用粘性
+  会话或共享存储（v0.7.0）
+- 镜像没做多架构构建（只有本地 `linux/amd64`），也没签名与 SBOM；CI 只验证
+  「能构建、能起来、不漏密钥」
 - 服务层没有真正的鉴权：`X-API-Key` 只是一道共享密钥闸门，没有用户、没有权限模型
 - `POST /messages` 不是幂等的：客户端重试就是第二次真的调用模型。幂等键留到接入
   真实业务（订单/库存）时再做，那里才有必要

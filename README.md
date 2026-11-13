@@ -9,7 +9,7 @@
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
 不依赖任何 Agent 框架，`pydantic` + `httpx` 就是全部运行时依赖。
 
-> 状态：v0.4.0，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式已可用，通过 365 个单元测试（97% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 100%）。FastAPI 服务层、RAG、MCP 仍在开发中，见 [路线图](#路线图)。
+> 状态：v0.6.2，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署 + JSON 结构化日志 + 限流 + Prometheus 指标已可用，通过 514 个单元测试（98% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
 
 ---
 
@@ -49,6 +49,7 @@
 | 不阻塞 | 同步 provider 与同步工具自动进线程池；一个 `time.sleep` 的工具不会让整个服务失去响应 |
 | 事件流式 | `agent.astream()` 边跑边产出事件（工具调用、结果、耗时），最后一项是完整结果；SSE 有真东西可推，不是攒完再切片 |
 | HTTP 服务 | `create_app(agent)` 出一个会话级 API：SSE 流式 + 心跳、同会话串行（忙则 409）、TTL/LRU 会话存储、可选 API Key |
+| 可部署 | 环境变量装配层（纯函数、可单测）、多阶段镜像 212 MB、非 root + 只读根、健康探针、优雅停机；CI 每次 push 都构建镜像并打真实 HTTP 探针 |
 
 ---
 
@@ -363,6 +364,10 @@ curl -sN -X POST localhost:8000/sessions/$SID/messages/stream \
 - **同一会话并发 = 409，不排队。** 两轮交错会把记忆写乱；而无上限的排队就是内存放大器
   （一个人狂点发送，服务替他攒下几百个待跑的模型调用）。409 让客户端立刻知道「上一个
   还没回」，这是更诚实的背压。
+- **客户端断开 = 取消，不是暂停。** 挂起的拉取被取消、生成器被 `aclose()`、本轮不写
+  记忆也不记历史（半途而废的问答不该污染会话）。断线后本轮作废，整轮重发；当前
+  **不支持续传**（`Last-Event-ID` 无处对账），v0.7 持久化后的正确形态是幂等重放。
+  详见 [docs/operations.md](docs/operations.md)。
 
 会话状态就在 `Session` 里：`memory`（跨会话召回）、`messages`（逐字历史）、`lock`
 （串行化）。**历史和记忆是两件事** —— 历史负责「接得上」（「那它呢」也有主语），
@@ -371,6 +376,148 @@ curl -sN -X POST localhost:8000/sessions/$SID/messages/stream \
 ```bash
 python examples/service_demo.py   # 进程内跑完整条链路，不需要端口与网络
 ```
+
+---
+
+## 可观测性与限流（v0.6.x）
+
+> 本节是概览；完整版（SSE 断线语义、PromQL 告警查询、日志排障路径、环境变量
+> 全表、故障速查表）见 **[docs/operations.md](docs/operations.md)**。
+
+**请求 ID 是贯穿一切的线索。** 客户端带了合法 `X-Request-ID` 就沿用，没有就生成
+一个（16 位 hex），并回写到响应头。访问日志、业务日志（provider 失败、流中断）
+都带上同一个 ID —— 用户报障时给一个 ID，就能从日志里捞出整条请求：
+
+```json
+{"ts":"2026-11-10T04:00:00.123456+00:00","level":"info","logger":"nexus_agents.service.access",
+ "event":"POST /sessions -> 201 in 1.2ms","request_id":"9f86d081884c47d4","method":"POST",
+ "path":"/sessions","status":201,"duration_ms":1.2}
+```
+
+**日志是 JSON Lines（一行一个对象）。** 人类可读文本对 grep 友好，对 ELK / Loki /
+CloudWatch 这类采集管道不友好 —— 管道里没有「哪一段是 session_id」的元数据。
+`NEXUS_LOG_JSON=true`（容器里推荐）开启；本地开发保持文本格式，`tail -f` 能读。
+异常折进 `exception` 字段而不是拼成多行 —— 一行日志永远是一行。
+
+**限流是每调用方一个令牌桶。** 容量 = 允许的瞬时突发，回填率 = 承诺的长期速率；
+固定窗口在边界处会放行两倍流量，令牌桶不会。调用方身份：有 `X-API-Key` 按密钥
+摘要（原文永不进内存表和日志），否则按客户端地址。超了 429：
+
+```bash
+$ curl -s -o /dev/null -w '%{http_code} %{header_json}\n' -X POST localhost:8000/sessions ...
+429 {"retry-after": ["1"]}
+{"detail":"rate limit exceeded; retry later"}
+```
+
+三个刻意的豁免与决定：
+
+- **`/healthz` 不限流也不记访问日志。** 编排器探针每几秒一打，吃业务配额会把健康
+  实例摘出负载均衡；全记进日志则日志量与在线时长成正比、与流量无关。
+- **限流默认关。** 本地开发不该被自己的测试请求限到；生产在 compose 里设
+  `NEXUS_RATE_LIMIT=120`（每分钟请求数）+ `NEXUS_RATE_LIMIT_BURST`（突发容量）。
+- **429 也进访问日志。** 中间件顺序刻意让日志层包住限流层 —— 限流器在线上挡了
+  多少请求、挡的是谁，必须能从日志查账，不能只靠它自己知道。
+
+**指标是 Prometheus 文本格式，`/metrics` 直接抓。** 零依赖手写的注册表
+（~180 行，不引入 `prometheus_client` 的全局单例和后台线程）暴露三个指标：
+`nexus_http_requests_total{route,status}`（错误率）、
+`nexus_http_request_duration_seconds`（延迟直方图）、
+`nexus_http_requests_in_flight`（背压信号，含挂着的 SSE 长连接）：
+
+```bash
+$ curl -s localhost:8000/metrics | grep '^nexus_' | head -4
+nexus_http_requests_total{route="/sessions",status="201"} 2
+nexus_http_request_duration_seconds_bucket{route="/sessions",le="0.005"} 1
+nexus_http_request_duration_seconds_count{route="/sessions"} 2
+nexus_http_requests_in_flight 0
+```
+
+指标层的三个决定（都是「demo 没事、上线出事」的地方）：
+
+- **路由标签用模板（`/sessions/{session_id}/messages`），不用原始路径。**
+  UUID 进标签就是势爆炸：每个新会话一条时间序列，公网服务几小时打爆
+  Prometheus。没路由可用的请求（404，以及被限流层在路由前拒绝的 429）
+  折叠成 `<unmatched>` —— 有界，且照样能查 429 率。
+- **SSE 时长记到流结束，不在 `response.start` 掐表。** 在响应头发出那刻
+  记延迟，长连接全部变成微秒级 —— 指标说谎比没有指标更糟。
+- **单进程诚实计数。** 多 worker 各数各的，靠抓取侧 `sum by (instance)`
+  聚合；和限流器一样，这里不假装支持多副本共享。
+
+---
+
+## 部署（Docker）
+
+```bash
+cp .env.example .env          # 填 NEXUS_API_KEY，或把 NEXUS_BASE_URL 指向本地模型
+docker compose up --build
+curl -s localhost:8000/healthz
+# {"status":"ok","version":"0.6.2","agent":"nexus-service","tools":["current_time"],"sessions":0}
+```
+
+不用 compose 也行：
+
+```bash
+docker build -t nexus-agents .
+docker run --rm -p 127.0.0.1:8000:8000 --env-file .env nexus-agents
+```
+
+**上线前先验配置**（只读环境变量、打印解析结果、不启动服务器，退出码 2 = 配置错；完整变量表见 [docs/operations.md](docs/operations.md)）：
+
+```bash
+docker run --rm --env-file .env nexus-agents python -m nexus_agents.service --check
+```
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `NEXUS_API_KEY` | — | 模型端点密钥；回退读 `OPENAI_API_KEY` |
+| `NEXUS_BASE_URL` | OpenAI 官方 | 任意 OpenAI 兼容端点（vLLM / Ollama / DeepSeek…）；指向本地时可不要密钥 |
+| `NEXUS_MODEL` | `gpt-4o-mini` | 模型名 |
+| `NEXUS_SERVICE_KEY` | 不设 | 设了之后 `/sessions*` 必须带 `X-API-Key`；留空 = 开放 |
+| `NEXUS_SYSTEM_PROMPT` | 不设 | 全局 system prompt |
+| `NEXUS_MAX_STEPS` | 12 | 单轮最多几步（工具调用循环上限） |
+| `NEXUS_MAX_INPUT_CHARS` | 8000 | 单条输入长度上限（超了 413） |
+| `NEXUS_MAX_SESSIONS` / `NEXUS_SESSION_TTL` | 1000 / 3600 | 会话容量与空闲过期（秒） |
+| `NEXUS_HEARTBEAT` | 15 | SSE 心跳间隔（秒），必须小于反代空闲超时 |
+| `NEXUS_RATE_LIMIT` | 不设 | 每调用方每分钟请求数；不设 = 不限流 |
+| `NEXUS_RATE_LIMIT_BURST` | 10 | 令牌桶容量（允许的瞬时突发） |
+| `NEXUS_LOG_JSON` | false | `true` = JSON Lines 日志（容器/采集管道推荐） |
+| `NEXUS_LOG_LEVEL` / `NEXUS_PORT` | info / 8000 | 日志级别、容器内监听端口 |
+
+六个不显然的决定：
+
+- **多阶段 + 先拷 `pyproject.toml` 再拷 `src`。** builder 只负责把源码和依赖编译成
+  wheel，runtime 阶段离线装 wheel（`--no-index`），镜像是 212 MB 而不是带着整套
+  构建工具链的 1 GB 量级 —— 少的不只是体积，还有「构建期依赖被当成运行期依赖」
+  这类隐患。层缓存按指令切分，日常改一行 Python 不会重装 pydantic。
+- **非 root + 只读根文件系统。** 镜像里 `USER app`（uid 10001），compose 里再叠
+  `read_only: true` + `tmpfs: /tmp` + `no-new-privileges`。容器逃逸的利用链第一步
+  通常是拿 root 再写文件，这两条一起把成本抬上去。
+- **探针不装 curl。** `HEALTHCHECK` 用 Python 标准库 `urllib` 请求 `/healthz`。
+  镜像里每多一个二进制就多一份漏洞面，而 urllib 随解释器已经在里面了。
+- **单 worker 是有意的。** 会话状态（记忆 / 消息流水 / 串行锁）还在进程内存里，
+  第二个 worker 会看到空的会话表，用户第二句话就 404。要 `--scale`，先把
+  `SessionStore` 换成 Redis/Postgres —— 顺序不能反。
+- **配置错就退出，退出码 2。** 缺密钥、端口写成 `8000:8000`、日志级别拼错，
+  都在启动阶段报错并说清是哪个变量（空字符串按「没填」处理，因为 compose 里
+  `VAR:` 展开成空串太常见）。1 留给「运行中失败」，编排器据此区分部署错误和崩溃。
+- **密钥不进构建上下文。** `.dockerignore` 排除 `.env*`（只放行 `.env.example`），
+  `--check` 输出只报 `api_key=set`。日志会被复制到 issue 里，密钥进去就收不回来。
+
+实测（2026-11-07，Docker Desktop 29.5.2，linux/amd64，本机）：
+
+| 项目 | 结果 |
+| --- | --- |
+| 镜像体积 | **212 MB**（python:3.13-slim + wheel 安装） |
+| 冷启动到 `/healthz` 200 | **1.5 s** |
+| `NEXUS_SERVICE_KEY` 闸门 | 无 header → **401**；带 header → **201** |
+| 上游不可达 | **502** `upstream model failed`（不是 500，也不是 200 + 半截答案） |
+| `docker stop` | **0.6 s** 干净退出，日志有 `Application shutdown complete` |
+| 运行身份 | `uid=10001(app)`，`ReadonlyRootfs=true` |
+
+CI 里有一个独立的 `docker` job 跑同样的东西：构建 → `compose config` → 体积上限
+断言 → 容器内 `--check`（并断言密钥没被打出来）→ 起容器打 `/healthz` → 闸门 401 →
+`id -u != 0`。**结论不是「我写了 Dockerfile」，而是「每次 push 都证明它还能构建、
+还能起来、还不漏密钥」。**
 
 ---
 
@@ -447,7 +594,7 @@ result.error      # "ValueError: kaboom"
 ## 测试与质量门禁
 
 ```bash
-pytest                                            # 365 个测试，全部离线
+pytest                                            # 448 个测试，全部离线
 pytest --cov=nexus_agents --cov-report=term-missing
 ruff check src tests examples
 mypy src/nexus_agents
@@ -455,8 +602,9 @@ mypy src/nexus_agents
 
 当前状态：
 
-- **365 passed**，平均耗时 ~2 秒（无网络、无 API Key、无真实等待）
-- 覆盖率 **97%**（`agent.py`、`graph.py`、`memory.py`、`checkpoint.py`、`types.py`、`tracing.py` 均 100%）
+- **448 passed**，平均耗时 ~3 秒（无网络、无 API Key、无真实等待）
+- 覆盖率 **97%**；`agent.py`、`graph.py`、`memory.py`、`checkpoint.py`、`types.py`、
+  `tracing.py` 与整个 `service/`（含部署装配 `runtime.py`、内置工具、进程入口）均 100%
 - `ruff` 与 `mypy` 零告警
 
 测试替身是 `ScriptedProvider`：可以回放固定响应，也可以传一个函数按请求动态决定返回什么 —— 这样连「模型看到工具结果后怎么反应」都能精确断言。
@@ -483,12 +631,15 @@ nexus-agents/
 │   ├── service/           可选依赖层：HTTP 服务（FastAPI）
 │   │   ├── app.py         create_app 工厂 / 路由 / SSE 生成器
 │   │   ├── sessions.py    Session + 存储协议 + TTL/LRU 内存实现
-│   │   └── sse.py         SSE 帧编码（纯函数，好测）
+│   │   ├── sse.py         SSE 帧编码（纯函数，好测）
+│   │   ├── runtime.py     环境变量 -> 配置 -> agent 的装配层（纯函数可测）
+│   │   ├── builtin.py     内置工具：current_time（让第一次 curl 就能看到工具链路）
+│   │   └── __main__.py    进程入口：uvicorn + 懒导入 + --check
 │   └── providers/
 │       ├── base.py        GenerateRequest / LLMResponse / LLMProvider 协议
 │       ├── scripted.py    确定性测试替身
 │       └── openai_compat.py  OpenAI 兼容 HTTP 后端
-├── tests/                 413 个单元测试
+├── tests/                 448 个单元测试
 ├── examples/
 │   ├── quickstart.py      单 Agent 端到端示例（离线）
 │   ├── graph_demo.py      循环 / 条件边 / checkpoint / Mermaid
@@ -499,6 +650,9 @@ nexus-agents/
 │   └── service_demo.py    HTTP 层：会话 / SSE / 409 / 会话视图
 ├── benchmarks/
 │   └── benchmark.py       离线性能基准（开销 / 并发 / 首帧 / HTTP 层）
+├── Dockerfile             多阶段构建：builder 编 wheel，runtime 只装 wheel
+├── docker-compose.yml     一条命令起来（healthcheck / 只读根 / 优雅停机）
+├── .env.example           环境变量模板（真 .env 在 .gitignore 里）
 └── docs/architecture.md   设计说明
 ```
 
@@ -511,8 +665,12 @@ nexus-agents/
 - [x] v0.3.0 记忆层：token 预算裁剪（工具调用原子性）、摘要压缩、BM25-lite 长期记忆
 - [x] v0.4.0 异步运行时：`arun` / `ainvoke` / `aresume`，同步与异步共用同一控制流；含事件级流式 `astream`
 - [x] v0.5.0 FastAPI 服务层：SSE（建在 `astream` 之上，含心跳与取消）、会话级历史与隔离、TTL/LRU 存储
-- [ ] v0.6.0 RAG 模块：切分、向量检索、重排、评测集
-- [ ] v0.7.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
+- [x] v0.6.0 容器化与部署：环境变量装配层、多阶段镜像、compose、健康探针、优雅停机、CI 镜像冒烟
+- [x] v0.6.1 可观测性与限流：JSON 结构化日志、`X-Request-ID` 贯穿访问/业务日志、每调用方令牌桶限流（429 + Retry-After）
+- [x] v0.6.2 Prometheus 指标：`/metrics` 文本格式、请求计数（路由模板标签）、延迟直方图、在途请求 gauge
+- [ ] v0.7.0 持久化会话存储：`SessionStore` 的 Redis / Postgres 实现（多 worker 的前置条件）
+- [ ] v0.8.0 RAG 模块：切分、向量检索、重排、评测集
+- [ ] v0.9.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
 
 ---
 
@@ -523,6 +681,9 @@ nexus-agents/
 - 工具异常会被捕获成结构化结果，原始堆栈不会泄漏给模型
 - 服务层：未知字段一律 422（不静默忽略），输入有长度上限，错误帧只回显自家异常，
   陌生异常的 message 绝不外泄；`X-API-Key` 用 `compare_digest` 比较
+- 部署：镜像以非 root（uid 10001）运行，compose 叠只读根文件系统与
+  `no-new-privileges`；`.dockerignore` 把 `.env*` 挡在构建上下文之外；
+  `--check` 与启动日志只报「密钥设置没设置」，CI 有专门断言防止密钥被打印
 
 ---
 

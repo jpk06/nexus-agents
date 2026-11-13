@@ -99,7 +99,7 @@ from .types import (
     user_message,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.6.2"
 
 __all__ = [
     # agent
