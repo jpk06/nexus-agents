@@ -46,6 +46,14 @@ event: agent.result       → 最后一帧：answer / stopped_reason / usage / s
 推论：**断线后这一轮作废，客户端应当整轮重发**。重发时如果上一轮的取消
 还没落地（毫秒级窗口），会得到 409，稍候重试即可。
 
+这条保证由**服务器**驱动，不由本仓库的代码单独保证：Starlette 的
+`StreamingResponse` 按 `scope["asgi"]["spec_version"]` 分两条取消路径 ——
+`>= 2.4` 靠 `send` 抛 `OSError`，更早（uvicorn 0.54 实报 `2.3`）靠监听
+`http.disconnect` 再取消发送任务。升级 uvicorn / Starlette 时要重跑
+`tests/test_service_live.py`（真起一个 uvicorn、真掐连接的那两个测试）——
+`httpx.ASGITransport` 不产生 `http.disconnect` 消息，进程内测试**验不到**这条
+路径。
+
 ### 不支持断线续传（以及为什么）
 
 SSE 协议原生支持 `id:` 字段 + 客户端重连时带 `Last-Event-ID` 实现续传。
@@ -186,7 +194,8 @@ docker compose logs service | grep 9f86d081884c47d4
 | `NEXUS_MODEL` | `gpt-4o-mini` | 模型名 |
 | `NEXUS_BASE_URL` | — | OpenAI 兼容端点（本地 vLLM/ollama 等） |
 | `NEXUS_TEMPERATURE` | — | 可选浮点 |
-| `NEXUS_MAX_TOKENS` | — | 可选整数 |
+| `NEXUS_MAX_TOKENS` | — | 可选整数（输出长度上限） |
+| `NEXUS_TOKEN_LIMIT_PARAM` | `max_tokens` | 上限字段名：OpenAI 推理模型（o 系列 / gpt-5 起，对 `max_tokens` 直接 400）设 `max_completion_tokens`；vLLM / Ollama / DeepSeek 等兼容端点保持 `max_tokens` |
 | `NEXUS_SYSTEM_PROMPT` | — | 覆盖默认 system |
 | `NEXUS_MAX_STEPS` | `12` | 单轮最大推理步数 |
 

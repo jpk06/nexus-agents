@@ -9,7 +9,7 @@
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
 不依赖任何 Agent 框架，`pydantic` + `httpx` 就是全部运行时依赖。
 
-> 状态：v0.6.3，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署 + JSON 结构化日志 + 限流 + Prometheus 指标已可用，通过 521 个单元测试（98% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
+> 状态：v0.6.4，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署 + JSON 结构化日志 + 限流 + Prometheus 指标已可用，通过 527 个单元测试（98% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
 
 ---
 
@@ -35,7 +35,7 @@
 | 工具定义 | `@tool` 从类型注解生成 JSON Schema，从 docstring 生成描述，**代码与描述不可能脱节** |
 | 参数校验 | 模型返回 `"7"` 而函数要 `int`？自动强转；多传字段、少传字段、非法枚举值都会被拦下 |
 | 错误隔离 | 工具抛异常不会炸掉 Agent —— 异常转成 `ToolResult(is_error=True)` 回喂模型，让它自我纠错 |
-| Provider 抽象 | Protocol 而非基类：`OpenAICompatibleProvider` 通吃 OpenAI / vLLM / Ollama / DeepSeek，`ScriptedProvider` 让测试零成本零网络 |
+| Provider 抽象 | Protocol 而非基类：`OpenAICompatibleProvider` 通吃 OpenAI / vLLM / Ollama / DeepSeek（输出上限字段名可在 `max_tokens` 与 `max_completion_tokens` 间切换 —— OpenAI 推理模型只认后者），`ScriptedProvider` 让测试零成本零网络 |
 | 可观测 | 每次运行产出完整事件流（含 LLM 调用耗时），可断言、可序列化 |
 | 成本可见 | token 用量跨步累加，直接挂在结果上 |
 | 诚实终止 | 跑满 `max_steps` 一定报 `max_steps`，绝不伪装成成功 |
@@ -455,7 +455,7 @@ nexus_http_requests_in_flight 0
 cp .env.example .env          # 填 NEXUS_API_KEY，或把 NEXUS_BASE_URL 指向本地模型
 docker compose up --build
 curl -s localhost:8000/healthz
-# {"status":"ok","version":"0.6.3","agent":"nexus-service","tools":["current_time"],"sessions":0}
+# {"status":"ok","version":"0.6.4","agent":"nexus-service","tools":["current_time"],"sessions":0}
 ```
 
 不用 compose 也行：
@@ -474,6 +474,7 @@ docker run --rm --env-file .env nexus-agents python -m nexus_agents.service --ch
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `NEXUS_API_KEY` | — | 模型端点密钥；回退读 `OPENAI_API_KEY` |
+| `NEXUS_TOKEN_LIMIT_PARAM` | `max_tokens` | 输出上限字段名：OpenAI 推理模型（o 系列 / gpt-5 起，对 `max_tokens` 直接 400）设 `max_completion_tokens`；vLLM / Ollama / DeepSeek 等兼容端点保持默认 |
 | `NEXUS_BASE_URL` | OpenAI 官方 | 任意 OpenAI 兼容端点（vLLM / Ollama / DeepSeek…）；指向本地时可不要密钥 |
 | `NEXUS_MODEL` | `gpt-4o-mini` | 模型名 |
 | `NEXUS_SERVICE_KEY` | 不设 | 设了之后 `/sessions*` 必须带 `X-API-Key`；留空 = 开放 |
@@ -598,7 +599,7 @@ result.error      # "ValueError: kaboom"
 ## 测试与质量门禁
 
 ```bash
-pytest                                            # 521 个测试，全部离线
+pytest                                            # 527 个测试（含真起 uvicorn 的断线端到端）
 pytest --cov=nexus_agents --cov-report=term-missing
 ruff check src tests examples
 mypy src/nexus_agents
@@ -606,8 +607,9 @@ mypy src/nexus_agents
 
 当前状态：
 
-- **521 passed**，平均耗时 ~3 秒（无网络、无 API Key、无真实等待）
-- 覆盖率 **97%**；`agent.py`、`graph.py`、`memory.py`、`checkpoint.py`、`types.py`、
+- **527 passed**，平均耗时 ~4 秒（无 API Key、无真实等待；断线测试在本机
+  回环上起一个一次性 uvicorn）
+- 覆盖率 **98%**；`agent.py`、`graph.py`、`memory.py`、`checkpoint.py`、`types.py`、
   `tracing.py` 与整个 `service/`（含部署装配 `runtime.py`、内置工具、进程入口）均 100%
 - `ruff` 与 `mypy` 零告警
 
@@ -643,7 +645,7 @@ nexus-agents/
 │       ├── base.py        GenerateRequest / LLMResponse / LLMProvider 协议
 │       ├── scripted.py    确定性测试替身
 │       └── openai_compat.py  OpenAI 兼容 HTTP 后端
-├── tests/                 521 个单元测试
+├── tests/                 527 个单元测试
 ├── examples/
 │   ├── quickstart.py      单 Agent 端到端示例（离线）
 │   ├── graph_demo.py      循环 / 条件边 / checkpoint / Mermaid
@@ -673,6 +675,7 @@ nexus-agents/
 - [x] v0.6.1 可观测性与限流：JSON 结构化日志、`X-Request-ID` 贯穿访问/业务日志、每调用方令牌桶限流（429 + Retry-After）
 - [x] v0.6.2 Prometheus 指标：`/metrics` 文本格式、请求计数（路由模板标签）、延迟直方图、在途请求 gauge
 - [x] v0.6.3 会话生命周期一致性：落账进临界区（两条路径同一不变量）、运行中的会话不被 LRU 淘汰/不被 TTL 回收、容量耗尽返回 503
+- [x] v0.6.4 Provider 上限字段开关：`max_completion_tokens`（OpenAI 推理模型）/ `max_tokens`（兼容端点），启动期校验；断线取消语义升级为「真起 uvicorn 的端到端测试」
 - [ ] v0.7.0 持久化会话存储：`SessionStore` 的 Redis / Postgres 实现（多 worker 的前置条件）
 - [ ] v0.8.0 RAG 模块：切分、向量检索、重排、评测集
 - [ ] v0.9.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
