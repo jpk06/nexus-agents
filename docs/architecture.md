@@ -355,7 +355,7 @@ SSE 断线语义、PromQL、日志排障、环境变量全表、故障速查—�
 - 流式是**事件级**：`astream` 还不知道 token 边界，真 token 流要等 provider 层的
   delta 协议（`AsyncIterator[str]` + tool_calls 增量拼装）
 - 工具串行执行：`arun` 下多个 tool call 仍按顺序跑，没有并行 fan-out
-- 检索是关键词式：同义词和改写查询召回不到（要语义检索得上 v0.6.0 的 RAG）
+- 检索是关键词式：同义词和改写查询召回不到（要语义检索得上 v0.8.0 的 RAG）
 - 摘要不保证事实无损：压缩比高时细节会丢，关键约束应显式写进 system prompt
 - 只支持 function-calling 风格的工具调用，不支持从纯文本里解析 ReAct 格式
 - 会话只在进程内存里：单机多副本部署会串话（同一会话落到不同 pod 就找不到），

@@ -20,7 +20,7 @@ from .metrics import (
 from .observability import JsonFormatter, RequestLoggingMiddleware, configure_logging
 from .ratelimit import RateLimiter, RateLimitMiddleware, TokenBucket
 from .runtime import EnvConfigError, RuntimeConfig, build_agent, parse_env
-from .sessions import InMemorySessionStore, Session, SessionStore
+from .sessions import InMemorySessionStore, Session, SessionCapacityError, SessionStore
 from .sse import SSE_HEADERS, SSE_MEDIA_TYPE, encode_comment, encode_event
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "Session",
     "SessionStore",
     "InMemorySessionStore",
+    "SessionCapacityError",
     "SSE_HEADERS",
     "SSE_MEDIA_TYPE",
     "encode_event",

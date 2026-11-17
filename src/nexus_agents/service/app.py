@@ -49,7 +49,12 @@ from ..tracing import TraceEvent
 from .metrics import PROMETHEUS_CONTENT_TYPE, Metrics, MetricsMiddleware, render
 from .observability import RequestLoggingMiddleware, current_request_id
 from .ratelimit import RateLimiter, RateLimitMiddleware
-from .sessions import InMemorySessionStore, Session, SessionStore
+from .sessions import (
+    InMemorySessionStore,
+    Session,
+    SessionCapacityError,
+    SessionStore,
+)
 from .sse import SSE_HEADERS, SSE_MEDIA_TYPE, encode_comment, encode_event
 
 __all__ = ["ServiceSettings", "create_app"]
@@ -249,10 +254,19 @@ async def create_session(
     body: CreateSessionRequest | None = None,
     store: SessionStore = Depends(get_store),
 ) -> CreateSessionResponse:
-    session = store.create(
-        system=body.system if body is not None else None,
-        memory=ConversationMemory(),
-    )
+    try:
+        session = store.create(
+            system=body.system if body is not None else None,
+            memory=ConversationMemory(),
+        )
+    except SessionCapacityError as exc:
+        # 503 而不是 500：这不是 bug，是「暂时没位置」。Retry-After 让客户端
+        # 知道该等，而不是立刻重试把情况弄得更糟。
+        raise HTTPException(
+            status_code=503,
+            detail="session capacity exhausted; retry later",
+            headers={"Retry-After": "1"},
+        ) from exc
     return CreateSessionResponse(session_id=session.id, created_at=session.created_at)
 
 
@@ -313,7 +327,11 @@ async def send_message(
                 extra={"request_id": current_request_id(request.scope), "session_id": session.id},
             )
             raise HTTPException(status_code=500, detail="agent run failed") from exc
-    session.record(result.messages)
+        # 落账必须还在临界区里 —— 和 SSE 路径保持一致。放到 ``async with``
+        # 外面等于「先放锁、再记账」：第二个请求有机会在两者之间读到一份
+        # 少了这一轮的历史（今天靠「中间没有 await」侥幸不出事，v0.7 的
+        # record 一旦写库就必然出事）。
+        session.record(result.messages)
     return result.to_dict()
 
 
@@ -365,6 +383,10 @@ def _check_length(text: str, settings: ServiceSettings) -> None:
 @contextlib.asynccontextmanager
 async def _exclusive(session: Session) -> AsyncIterator[Session]:
     """串行化同一会话的两次运行，忙则直接 409。
+
+    临界区覆盖的不只是「跑模型」，还有**收尾落账**（``session.record``）。
+    「跑完了但账还没记」这段时间对下一个请求是不可见的窗口：它会读到一份
+    少了一轮的历史，然后两个人各自往下写。锁必须一直持有到账记完。
 
     为什么拒绝而不是排队
     --------------------
@@ -468,6 +490,7 @@ async def _frames(
                 return
 
             if isinstance(item, AgentResult):
+                # 锁直到 ``finally`` 才放 —— 落账在临界区内，JSON 路径同理
                 session.record(item.messages)
                 yield encode_event("agent.result", _result_payload(item))
             else:

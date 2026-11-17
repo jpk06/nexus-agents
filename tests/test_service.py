@@ -31,6 +31,7 @@ from nexus_agents.providers.base import GenerateRequest, LLMResponse
 from nexus_agents.service import (
     InMemorySessionStore,
     ServiceSettings,
+    SessionCapacityError,
     create_app,
     encode_comment,
     encode_event,
@@ -195,6 +196,65 @@ def test_store_delete_reports_whether_anything_was_there() -> None:
     assert store.delete(session.id) is True
     assert store.delete(session.id) is False
     assert store.count() == 0
+
+
+# ------------------------------------------------------------------ 在跑的一轮不许被回收
+
+
+@pytest.mark.asyncio
+async def test_store_never_evicts_a_session_that_is_running_a_turn() -> None:
+    """淘汰只能挑空闲会话：删掉跑到一半的会话 = 用户看着答案流回来，账本却没了。"""
+    store = InMemorySessionStore(max_sessions=2, ttl_seconds=1000)
+    running = store.create()
+    idle = store.create()
+    await running.lock.acquire()
+    try:
+        store.create()
+        assert store.get(running.id) is running
+        assert store.get(idle.id) is None  # 被挑走的是最久没用的那个空闲会话
+        assert store.evicted == 1
+    finally:
+        running.lock.release()
+
+
+@pytest.mark.asyncio
+async def test_store_refuses_admission_when_every_session_is_busy() -> None:
+    """全都忙时宁可 503，也不悄悄突破 max_sessions（那等于关掉内存保护）。"""
+    store = InMemorySessionStore(max_sessions=1, ttl_seconds=1000)
+    running = store.create()
+    await running.lock.acquire()
+    try:
+        with pytest.raises(SessionCapacityError):
+            store.create()
+        assert store.count() == 1
+        assert store.evicted == 0
+    finally:
+        running.lock.release()
+
+
+@pytest.mark.asyncio
+async def test_expired_session_that_is_running_a_turn_survives_the_ttl_sweep() -> None:
+    """跑得比 TTL 久的是长工具调用，不是死会话。"""
+    now = [0.0]
+    store = InMemorySessionStore(ttl_seconds=10, clock=lambda: now[0])
+    running = store.create()
+    await running.lock.acquire()
+    try:
+        now[0] += 11
+        assert store.get(running.id) is running
+    finally:
+        running.lock.release()
+
+    now[0] += 11
+    assert store.get(running.id) is None  # 跑完就恢复正常的过期语义
+
+
+def test_record_outside_the_turn_lock_is_a_loud_failure() -> None:
+    session = Session(id="s", memory=ConversationMemory(), created_at=0.0)
+    with pytest.raises(RuntimeError, match="turn lock"):
+        session.record([user_message("hi")])
+    assert session.turns == 0
+    assert session.messages == []
 
 
 @pytest.mark.parametrize(
@@ -659,3 +719,56 @@ async def test_internal_agent_failure_is_500_not_502() -> None:
 
     assert response.status_code == 500
     assert response.json()["detail"] == "agent run failed"
+
+
+# ================================================================ 收尾时序：两条路径必须一致
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["messages", "messages/stream"])
+async def test_audit_write_happens_inside_the_critical_section(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """落账时锁必须还在手上 —— 否则「跑完了但没记账」就是一个能被读到的窗口。
+
+    验证方式不是看顺序，而是直接问一句：``record`` 被调用时，这一轮还占着锁吗？
+    """
+    held: list[bool] = []
+    original = Session.record
+
+    def spy(self: Session, messages: Any) -> None:
+        held.append(self.busy)
+        original(self, messages)
+
+    monkeypatch.setattr(Session, "record", spy)
+    async with client_for(build_app(ScriptedProvider(["ok"]))) as client:
+        sid = (await client.post("/sessions", json={})).json()["session_id"]
+        await client.post(f"/sessions/{sid}/{path}", json={"text": "hi"})
+        view = (await client.get(f"/sessions/{sid}")).json()
+
+    assert held == [True]
+    assert view["turns"] == 1  # 锁放了，账也记了 —— 两件事都不缺
+
+
+@pytest.mark.asyncio
+async def test_create_session_is_503_while_every_session_is_mid_turn() -> None:
+    """容量满 + 全在跑 = 暂时没位置。503 带 Retry-After，而不是删掉别人的会话。"""
+    provider = GatedProvider()
+    app = build_app(provider, max_sessions=1)
+    async with client_for(app) as client:
+        sid = (await client.post("/sessions", json={})).json()["session_id"]
+        streaming = asyncio.create_task(
+            client.post(f"/sessions/{sid}/messages/stream", json={"text": "慢问题"})
+        )
+        await asyncio.wait_for(provider.started.wait(), timeout=2)
+
+        blocked = await client.post("/sessions", json={})
+
+        provider.release.set()
+        assert (await asyncio.wait_for(streaming, timeout=2)).status_code == 200
+        # 那一轮跑完，会话回到空闲 —— 立刻又可以建新会话了
+        recovered = await client.post("/sessions", json={})
+
+    assert blocked.status_code == 503
+    assert blocked.headers["retry-after"] == "1"
+    assert recovered.status_code == 201

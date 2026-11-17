@@ -66,6 +66,17 @@ SSE 协议原生支持 `id:` 字段 + 客户端重连时带 `Last-Event-ID` 实�
 排队没有上限就是内存放大器（一个人狂点发送，服务替他攒几百个模型调用）。
 客户端拿到 409 的正确处理是：等 `agent.result` 或 `error` 帧之后再发。
 
+### 会话容量：503，也不淘汰正在跑的会话
+
+`NEXUS_MAX_SESSIONS` 到顶时，进程内存储会按 LRU 淘汰**空闲**会话给新会话腾位。
+如果满了而且全都在跑，`POST /sessions` 返回 `503` + `Retry-After: 1` —— 这不是故障，
+是准入控制：删掉一个跑到一半的会话，用户会看到答案流回来而 `GET /sessions/{id}` 404，
+这一轮的账本直接消失。
+
+排查思路：`503` 持续出现说明 `NEXUS_MAX_SESSIONS` 相对并发量设小了，或者有客户端
+在长时间占着会话不结束（看 `/metrics` 的 `nexus_http_requests_in_flight`）。**不要**靠调大
+TTL 缓解 —— TTL 只回收空闲会话，与「全都忙」无关。
+
 ### 浏览器客户端注意
 
 SSE 用 POST（请求体 + 鉴权头 + 幂等键都要用），所以浏览器原生
@@ -186,7 +197,7 @@ docker compose logs service | grep 9f86d081884c47d4
 | `NEXUS_HOST` / `NEXUS_PORT` | `0.0.0.0` / `8000` | 监听地址 |
 | `NEXUS_SERVICE_KEY` | — | 共享密钥（闸门，非鉴权；设置后请求须带 `X-API-Key`） |
 | `NEXUS_MAX_INPUT_CHARS` | `8000` | 单条输入上限（超出 413） |
-| `NEXUS_MAX_SESSIONS` | `1000` | 在线会话上限（超出 LRU 淘汰） |
+| `NEXUS_MAX_SESSIONS` | `1000` | 在线会话上限（超出优先淘汰空闲会话；全都忙则新建会话 503） |
 | `NEXUS_SESSION_TTL` | `3600` | 会话空闲过期秒数（过期后 404） |
 | `NEXUS_HISTORY_MESSAGES` | `40` | 每请求携带的逐字历史条数 |
 | `NEXUS_HEARTBEAT` | `15` | SSE 心跳间隔秒数（须小于中间设备空闲超时） |
@@ -209,6 +220,7 @@ docker compose logs service | grep 9f86d081884c47d4
 | --- | --- | --- |
 | 客户端 404「session not found or expired」 | 会话过期（TTL）或被 LRU 淘汰，或进程重启（内存存储清零） | 客户端重建会话重发；频繁出现 → 调大 `NEXUS_SESSION_TTL` 或等 v0.7 持久化 |
 | 客户端 409 | 同会话上一轮未结束 | 等上一轮结束再发；不要自动重试轰炸 |
+| 客户端 503 + `Retry-After`（`POST /sessions`） | 容量已满且没有空闲会话可淘汰 | 按 `Retry-After` 重试；持续出现就调大 `NEXUS_MAX_SESSIONS`，并查是否有长占会话的客户端 |
 | 客户端 429 + `Retry-After` | 命中限流 | 按 `Retry-After` 等待；服务端调 `NEXUS_RATE_LIMIT` |
 | 客户端 502 | 上游模型失败（非本服务 bug） | 查日志里该 request_id 的 `provider failed`；检查 `NEXUS_BASE_URL` / 密钥 |
 | SSE 流卡住，只有 `: keep-alive` | 模型在思考（正常）或上游真的挂了（超时前） | 看时长与上游健康；心跳说明连接本身是活的 |

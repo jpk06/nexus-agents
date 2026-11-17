@@ -9,7 +9,7 @@
 用 Python 从零实现 ReAct 循环、工具调用、Schema 生成、Provider 抽象和链路追踪 ——
 不依赖任何 Agent 框架，`pydantic` + `httpx` 就是全部运行时依赖。
 
-> 状态：v0.6.2，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署 + JSON 结构化日志 + 限流 + Prometheus 指标已可用，通过 514 个单元测试（98% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
+> 状态：v0.6.3，ReAct 循环 + 状态图编排 + 记忆层 + 异步运行时 + 事件流式 + FastAPI 服务层 + Docker 部署 + JSON 结构化日志 + 限流 + Prometheus 指标已可用，通过 521 个单元测试（98% 覆盖，`agent.py` / `graph.py` / `memory.py` / `checkpoint.py` 与整个 `service/` 100%）。镜像 212 MB，`docker compose up` 一条命令起来；RAG、MCP、持久化会话存储仍在开发中，见 [路线图](#路线图)。
 
 ---
 
@@ -349,7 +349,7 @@ curl -sN -X POST localhost:8000/sessions/$SID/messages/stream \
 | `POST /sessions/{id}/messages/stream` | 同一轮，SSE 逐事件推送 |
 | `DELETE /sessions/{id}` | 结束会话 |
 
-四个不显然但要紧的决定：
+六个不显然但要紧的决定：
 
 - **SSE 走 POST。** 浏览器原生 `EventSource` 只能 GET、不能带请求体，也不能加鉴权头；
   把问题塞进查询串既难看又有长度上限。所以用 POST + `text/event-stream`，客户端用
@@ -368,6 +368,10 @@ curl -sN -X POST localhost:8000/sessions/$SID/messages/stream \
   记忆也不记历史（半途而废的问答不该污染会话）。断线后本轮作废，整轮重发；当前
   **不支持续传**（`Last-Event-ID` 无处对账），v0.7 持久化后的正确形态是幂等重放。
   详见 [docs/operations.md](docs/operations.md)。
+- **在跑的一轮拥有它的会话。** 落账（`session.record`）在临界区内完成 —— 一旦挪到
+  放锁之后，第二个请求就可能读到「没有这一轮」的历史（v0.7 的落账要写库，中间
+  必然有 await，那时就是真窗口）。淘汰与过期同理：只回收**空闲**会话，跑到一半的
+  会话既不过期也不被挤掉；全都在跑时 `POST /sessions` 返回 503，而不是删掉别人的轮次。
 
 会话状态就在 `Session` 里：`memory`（跨会话召回）、`messages`（逐字历史）、`lock`
 （串行化）。**历史和记忆是两件事** —— 历史负责「接得上」（「那它呢」也有主语），
@@ -451,7 +455,7 @@ nexus_http_requests_in_flight 0
 cp .env.example .env          # 填 NEXUS_API_KEY，或把 NEXUS_BASE_URL 指向本地模型
 docker compose up --build
 curl -s localhost:8000/healthz
-# {"status":"ok","version":"0.6.2","agent":"nexus-service","tools":["current_time"],"sessions":0}
+# {"status":"ok","version":"0.6.3","agent":"nexus-service","tools":["current_time"],"sessions":0}
 ```
 
 不用 compose 也行：
@@ -594,7 +598,7 @@ result.error      # "ValueError: kaboom"
 ## 测试与质量门禁
 
 ```bash
-pytest                                            # 448 个测试，全部离线
+pytest                                            # 521 个测试，全部离线
 pytest --cov=nexus_agents --cov-report=term-missing
 ruff check src tests examples
 mypy src/nexus_agents
@@ -602,7 +606,7 @@ mypy src/nexus_agents
 
 当前状态：
 
-- **448 passed**，平均耗时 ~3 秒（无网络、无 API Key、无真实等待）
+- **521 passed**，平均耗时 ~3 秒（无网络、无 API Key、无真实等待）
 - 覆盖率 **97%**；`agent.py`、`graph.py`、`memory.py`、`checkpoint.py`、`types.py`、
   `tracing.py` 与整个 `service/`（含部署装配 `runtime.py`、内置工具、进程入口）均 100%
 - `ruff` 与 `mypy` 零告警
@@ -639,7 +643,7 @@ nexus-agents/
 │       ├── base.py        GenerateRequest / LLMResponse / LLMProvider 协议
 │       ├── scripted.py    确定性测试替身
 │       └── openai_compat.py  OpenAI 兼容 HTTP 后端
-├── tests/                 448 个单元测试
+├── tests/                 521 个单元测试
 ├── examples/
 │   ├── quickstart.py      单 Agent 端到端示例（离线）
 │   ├── graph_demo.py      循环 / 条件边 / checkpoint / Mermaid
@@ -668,6 +672,7 @@ nexus-agents/
 - [x] v0.6.0 容器化与部署：环境变量装配层、多阶段镜像、compose、健康探针、优雅停机、CI 镜像冒烟
 - [x] v0.6.1 可观测性与限流：JSON 结构化日志、`X-Request-ID` 贯穿访问/业务日志、每调用方令牌桶限流（429 + Retry-After）
 - [x] v0.6.2 Prometheus 指标：`/metrics` 文本格式、请求计数（路由模板标签）、延迟直方图、在途请求 gauge
+- [x] v0.6.3 会话生命周期一致性：落账进临界区（两条路径同一不变量）、运行中的会话不被 LRU 淘汰/不被 TTL 回收、容量耗尽返回 503
 - [ ] v0.7.0 持久化会话存储：`SessionStore` 的 Redis / Postgres 实现（多 worker 的前置条件）
 - [ ] v0.8.0 RAG 模块：切分、向量检索、重排、评测集
 - [ ] v0.9.0 MCP 客户端：把外部 MCP 工具接进 `ToolRegistry`
