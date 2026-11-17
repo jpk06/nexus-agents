@@ -11,6 +11,8 @@ dist/
 venv/
 .env
 .env.*
+# 但要放行模板：只含变量名和说明，没有任何密钥
+!.env.example
 
 # Tooling caches
 .pytest_cache/

@@ -1,0 +1,42 @@
+# 构建上下文里不要出现「本地开发残留」
+#
+# `.venv/` 是最容易忘记的一条：它通常有几百 MB，而且里面是**宿主机平台**的
+# 二进制。拷进去不但让 `docker build` 慢几十秒，还可能让 builder 复用宿主机
+# 的包、掩盖掉「依赖没声明在 pyproject 里」的问题。
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 密钥：绝对不进构建上下文（进了就会留在镜像层的历史里，删不掉）
+.env
+.env.*
+!.env.example
+
+# 工具缓存与覆盖率产物
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# VCS 与编辑器
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 文档与本地脚本不参与构建（README/LICENSE 由 Dockerfile 显式 COPY）
+docs/
+benchmarks/
+examples/
+*.md
+!README.md
+tests/

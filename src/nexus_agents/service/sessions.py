@@ -32,10 +32,26 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from ..errors import NexusError
 from ..memory import ConversationMemory
 from ..types import Message, Role
 
-__all__ = ["Session", "SessionStore", "InMemorySessionStore"]
+__all__ = ["Session", "SessionStore", "InMemorySessionStore", "SessionCapacityError"]
+
+
+class SessionCapacityError(NexusError):
+    """容量已满，且没有任何会话可以被安全淘汰。
+
+    这是一个**准入控制**信号，不是内部错误：所有会话都正在跑（都持着锁），
+    淘汰任何一个都等于把一个正在进行的轮次连人带账本一起扔掉。此时唯一
+    诚实的回答是「现在建不了新会话，稍后重试」，而不是「先建，回头再说」。
+    """
+
+    default_message = "session capacity exhausted; every session is running a turn"
+
+    def __init__(self, max_sessions: int) -> None:
+        super().__init__()
+        self.max_sessions = max_sessions
 
 
 @dataclass
@@ -68,7 +84,22 @@ class Session:
 
         system 消息整条跳过：里面有注入的召回片段，存下来既占地方，又会在
         下一次 GET 时让人误以为「用户真说过这些」。
+
+        为什么必须在锁内调用
+        --------------------
+        收尾（落账 + 释放锁）和开跑（读历史）之间不能有窗口：一旦
+        ``record`` 落到 ``release`` 之后，第二个请求就可能读到「没有这一轮」
+        的历史。今天它是纯内存操作、两条语句之间没有 await，所以窗口还没被
+        观察到；v0.7 的 ``record`` 要写数据库，中间必然有 await —— 那时
+        这个顺序就从「理论问题」变成「第二轮读不到第一轮」的线上故障。
+
+        与其等 v0.7 再靠人记住，不如让违规**当场炸掉**。
         """
+        if not self.busy:
+            raise RuntimeError(
+                "Session.record() must be called while the turn lock is held; "
+                "finish the turn inside the critical section."
+            )
         for message in messages:
             if message.role is Role.SYSTEM:
                 continue
@@ -97,7 +128,12 @@ class Session:
 
 
 class SessionStore(Protocol):
-    """Where sessions live. 换 Redis 时实现这四个方法就够了。"""
+    """Where sessions live. 换 Redis 时实现这四个方法就够了。
+
+    ``create`` 在「容量已满且没有可淘汰的空闲会话」时必须抛
+    :class:`SessionCapacityError`，而不是悄悄超限或扔掉正在跑的会话 ——
+    这条契约由路由层映射成 503，换实现时不能改。
+    """
 
     def create(
         self, *, system: str | None = None, memory: ConversationMemory | None = None
@@ -123,6 +159,12 @@ class InMemorySessionStore:
     ``get()`` 会把会话移到队尾（真正的 LRU 语义），也会顺手判掉过期。
     过期只在访问时判断 + 创建时批量清理，不另起后台任务：一个演示服务
     不值得为 GC 多开一个协程。
+
+    一条硬规则：**正在跑的会话既不过期也不被淘汰**。会话不是可以随时丢弃的
+    缓存条目 —— 它身上挂着一条正在进行的推理、一份记忆和一把锁。把跑到一半
+    的会话删掉，用户会看到答案流回来，然后 ``GET /sessions/{id}`` 404，
+    这一轮的账本直接消失。所以「回收」只针对空闲会话；全都忙的时候宁可
+    拒绝准入（503），也不动别人的轮次。
     """
 
     def __init__(
@@ -151,8 +193,7 @@ class InMemorySessionStore:
     ) -> Session:
         self._drop_expired()
         while len(self._sessions) >= self.max_sessions:
-            self._sessions.popitem(last=False)
-            self.evicted += 1
+            self._evict_one_idle()
         session = Session(
             id=uuid.uuid4().hex,
             memory=memory if memory is not None else ConversationMemory(),
@@ -168,7 +209,9 @@ class InMemorySessionStore:
         if session is None:
             return None
         now = self._clock()
-        if now - session.last_used > self.ttl_seconds:
+        # 正在跑的一轮不算过期：跑得比 TTL 还久的是长工具调用，不是死会话。
+        # 认领它的那次运行还没结束，删掉映射只会让收尾写进一个孤儿对象。
+        if now - session.last_used > self.ttl_seconds and not session.busy:
             # 过期即删除：让「拿到的会话一定还活着」成为调用方可以依赖的事实
             del self._sessions[session_id]
             return None
@@ -189,10 +232,29 @@ class InMemorySessionStore:
 
         这样每次创建的开销只和「本次真正过期的数量」有关，而不是和总容量
         有关 —— 满容量时全表扫会让创建退化成 O(n)。
+
+        队首正在跑时立即停手：LRU 顺序按 ``last_used`` 排，队首既然还在用，
+        后面的只会更新，等它跑完下一轮再来清。
         """
         now = self._clock()
         while self._sessions:
             session_id, session = next(iter(self._sessions.items()))
-            if now - session.last_used <= self.ttl_seconds:
+            if session.busy or now - session.last_used <= self.ttl_seconds:
                 break
             del self._sessions[session_id]
+
+    def _evict_one_idle(self) -> None:
+        """淘汰一个**空闲**会话；一个都找不到就拒绝准入。
+
+        为什么不直接 ``popitem(last=False)``：队首可能正有一轮在跑，淘汰它
+        等于把用户正在等的答案连账本一起扔掉。而这个循环又不能无界重试
+        —— ``max_sessions`` 的上限一旦松掉，内存保护就没了。所以「全都忙」
+        只能往外推：调用方拿到 503，稍后重试。
+        """
+        for session_id, session in self._sessions.items():
+            if session.busy:
+                continue
+            del self._sessions[session_id]
+            self.evicted += 1
+            return
+        raise SessionCapacityError(self.max_sessions)

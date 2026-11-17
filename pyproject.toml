@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-agents"
-version = "0.5.0"
+version = "0.6.4"
 description = "A small, explicit and fully testable runtime for LLM agents and multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -48,7 +48,14 @@ dev = [
     "mypy>=1.10",
     # 测试要覆盖 HTTP 层，所以 dev 里必须有它 —— CI 只装 .[dev]
     "fastapi>=0.110",
+    # 断线取消语义由 ASGI 服务器驱动（Starlette 按 spec_version 分两条
+    # 取消路径），进程内替身验不到 —— 测试里真起一个 uvicorn 再掐连接
+    "uvicorn>=0.30",
 ]
+
+# 容器和 systemd 都能直接调用它；``python -m nexus_agents.service`` 等价
+[project.scripts]
+nexus-service = "nexus_agents.service.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/jpk06/nexus-agents"

@@ -31,9 +31,19 @@ from ..types import (
 )
 from .base import GenerateRequest, LLMResponse
 
-__all__ = ["OpenAICompatibleProvider", "DEFAULT_BASE_URL"]
+__all__ = ["OpenAICompatibleProvider", "DEFAULT_BASE_URL", "TOKEN_LIMIT_PARAMS"]
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+#: 输出长度上限有两个字段名，而且**没有两边都认的写法**。
+#:
+#: - OpenAI 自 o 系列 / gpt-5 起只认 ``max_completion_tokens``，发 ``max_tokens``
+#:   直接 400 ``Unsupported parameter``（连带 ``temperature`` 也会被拒）；
+#: - vLLM / Ollama / DeepSeek / LM Studio 这些兼容端点大多仍只认 ``max_tokens``。
+#:
+#: 所以这里不猜模型名（模型名会变，猜错就是线上 400），改成显式开关，
+#: 默认保持 ``max_tokens`` —— 兼容端点的用户什么都不用改。
+TOKEN_LIMIT_PARAMS: tuple[str, ...] = ("max_tokens", "max_completion_tokens")
 
 _FINISH_REASON_MAP = {
     "stop": FinishReason.STOP,
@@ -63,8 +73,16 @@ class OpenAICompatibleProvider:
         max_retries: int = 2,
         backoff_base: float = 0.5,
         extra_headers: dict[str, str] | None = None,
+        token_limit_param: str = "max_tokens",
     ) -> None:
         self.model = model
+        if token_limit_param not in TOKEN_LIMIT_PARAMS:
+            # 拼错就当场报错，不要发出去等上游 400 —— 那个报错离配置差着三层
+            raise ValueError(
+                f"token_limit_param must be one of {', '.join(TOKEN_LIMIT_PARAMS)}, "
+                f"got {token_limit_param!r}"
+            )
+        self._token_limit_param = token_limit_param
         self._max_retries = max(0, max_retries)
         self._backoff_base = backoff_base
         self._timeout = timeout
@@ -227,7 +245,9 @@ class OpenAICompatibleProvider:
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_tokens is not None:
-            payload["max_tokens"] = request.max_tokens
+            # 字段名由构造参数决定：OpenAI 推理模型只认 max_completion_tokens，
+            # 兼容端点只认 max_tokens，见 TOKEN_LIMIT_PARAMS 的说明
+            payload[self._token_limit_param] = request.max_tokens
         if request.tools:
             payload["tools"] = [t.to_api_payload() for t in request.tools]
             payload["tool_choice"] = "auto"

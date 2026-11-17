@@ -9,7 +9,18 @@
 from __future__ import annotations
 
 from .app import ServiceSettings, create_app
-from .sessions import InMemorySessionStore, Session, SessionStore
+from .builtin import BUILTIN_TOOLS, current_time
+from .metrics import (
+    DEFAULT_BUCKETS,
+    PROMETHEUS_CONTENT_TYPE,
+    Metrics,
+    MetricsMiddleware,
+    render,
+)
+from .observability import JsonFormatter, RequestLoggingMiddleware, configure_logging
+from .ratelimit import RateLimiter, RateLimitMiddleware, TokenBucket
+from .runtime import EnvConfigError, RuntimeConfig, build_agent, parse_env
+from .sessions import InMemorySessionStore, Session, SessionCapacityError, SessionStore
 from .sse import SSE_HEADERS, SSE_MEDIA_TYPE, encode_comment, encode_event
 
 __all__ = [
@@ -18,8 +29,28 @@ __all__ = [
     "Session",
     "SessionStore",
     "InMemorySessionStore",
+    "SessionCapacityError",
     "SSE_HEADERS",
     "SSE_MEDIA_TYPE",
     "encode_event",
     "encode_comment",
+    # 部署装配：环境变量 -> 对象
+    "RuntimeConfig",
+    "EnvConfigError",
+    "parse_env",
+    "build_agent",
+    "BUILTIN_TOOLS",
+    "current_time",
+    # 可观测性与限流
+    "JsonFormatter",
+    "RequestLoggingMiddleware",
+    "configure_logging",
+    "RateLimiter",
+    "RateLimitMiddleware",
+    "TokenBucket",
+    "Metrics",
+    "MetricsMiddleware",
+    "render",
+    "PROMETHEUS_CONTENT_TYPE",
+    "DEFAULT_BUCKETS",
 ]
