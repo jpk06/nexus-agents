@@ -29,7 +29,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from ..agent import AgentConfig, ReActAgent
-from ..providers.openai_compat import DEFAULT_BASE_URL, OpenAICompatibleProvider
+from ..providers.openai_compat import (
+    DEFAULT_BASE_URL,
+    TOKEN_LIMIT_PARAMS,
+    OpenAICompatibleProvider,
+)
 from ..tools import ToolSpec
 from .app import ServiceSettings
 from .builtin import BUILTIN_TOOLS
@@ -74,6 +78,10 @@ class RuntimeConfig:
     #: 收到 SIGTERM 后等待在途请求收尾的秒数。SSE 连接可能正开到一半，
     #: 直接掐断会让客户端看到一个「没有 error 帧的截断流」。
     graceful_timeout: int = 10
+    #: 输出长度上限走哪个字段名。OpenAI 的推理模型（o 系列 / gpt-5 起）只认
+    #: ``max_completion_tokens``，兼容端点（vLLM / Ollama / DeepSeek）只认
+    #: ``max_tokens`` —— 猜模型名会错，所以留给部署者显式声明。
+    token_limit_param: str = "max_tokens"
 
     def describe(self) -> str:
         """One line per setting, safe to print in logs and CI output."""
@@ -97,6 +105,7 @@ class RuntimeConfig:
                 f"log_level={self.log_level}",
                 f"log_json={self.log_json}",
                 f"graceful_timeout={self.graceful_timeout}",
+                f"token_limit_param={self.token_limit_param}",
             ]
         )
 
@@ -223,6 +232,14 @@ def parse_env(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
             f"NEXUS_LOG_LEVEL must be one of {', '.join(_LOG_LEVELS)}, got {log_level!r}"
         )
 
+    token_limit_param = _text(env, "NEXUS_TOKEN_LIMIT_PARAM", "max_tokens") or "max_tokens"
+    if token_limit_param not in TOKEN_LIMIT_PARAMS:
+        raise EnvConfigError(
+            "NEXUS_TOKEN_LIMIT_PARAM must be one of "
+            f"{', '.join(TOKEN_LIMIT_PARAMS)} (max_completion_tokens for OpenAI "
+            f"reasoning models, max_tokens for compatible servers), got {token_limit_param!r}"
+        )
+
     rate_limit = _optional_float(env, "NEXUS_RATE_LIMIT")
     # 这里必须抛 EnvConfigError 而不是让 ServiceSettings 抛 ValueError：
     # 进程入口只捕获前者（退出码 2 + 一行人话），后者会变成一段 traceback
@@ -263,6 +280,7 @@ def parse_env(environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         log_level=log_level,
         log_json=_bool(env, "NEXUS_LOG_JSON", default=False),
         graceful_timeout=_int(env, "NEXUS_GRACEFUL_TIMEOUT", 10, minimum=0),
+        token_limit_param=token_limit_param,
     )
 
 
@@ -282,5 +300,6 @@ def build_agent(
         model=config.model,
         base_url=config.base_url,
         api_key=config.api_key,
+        token_limit_param=config.token_limit_param,
     )
     return ReActAgent(provider, tools, config=config.agent, name="nexus-service")

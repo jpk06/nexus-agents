@@ -165,6 +165,54 @@ def test_sends_tools_and_sampling_options():
     assert captured["body"]["messages"][0]["role"] == "user"
 
 
+def test_token_limit_param_switches_the_wire_field():
+    """OpenAI 推理模型只认 max_completion_tokens —— 字段名必须可切换。
+
+    背景：o 系列 / gpt-5 起对 ``max_tokens`` 直接 400 ``Unsupported
+    parameter``；vLLM / Ollama 等兼容端点又只认 ``max_tokens``。
+    两种世界都要能跑，所以是显式开关而不是猜模型名。
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(req.content)
+        return httpx.Response(200, json=chat_payload("ok"))
+
+    captured: dict[str, object] = {}
+    provider = OpenAICompatibleProvider(
+        model="gpt-reasoning",
+        client=make_client(handler),
+        token_limit_param="max_completion_tokens",
+    )
+    provider.generate(GenerateRequest(messages=(user_message("hi"),), max_tokens=512))
+
+    assert captured["body"]["max_completion_tokens"] == 512
+    assert "max_tokens" not in captured["body"]
+
+
+def test_token_limit_param_rejects_unknown_values():
+    # 拼错要在构造期就炸，不能等上游用 400 回答「你配置错了」
+    with pytest.raises(ValueError, match="token_limit_param"):
+        OpenAICompatibleProvider(
+            model="m",
+            client=make_client(lambda r: httpx.Response(200, json=chat_payload("ok"))),
+            token_limit_param="maxOutputTokens",
+        )
+
+
+def test_token_limit_param_default_keeps_max_tokens():
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(req.content)
+        return httpx.Response(200, json=chat_payload("ok"))
+
+    provider = OpenAICompatibleProvider(model="m", client=make_client(handler))
+    provider.generate(GenerateRequest(messages=(user_message("hi"),), max_tokens=8))
+
+    assert captured["body"]["max_tokens"] == 8
+    assert "max_completion_tokens" not in captured["body"]
+
+
 def test_omits_optional_fields_when_unset():
     captured = {}
 

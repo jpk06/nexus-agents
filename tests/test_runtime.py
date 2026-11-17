@@ -59,8 +59,23 @@ def test_defaults_with_only_an_api_key() -> None:
     assert config.port == 8000
     assert config.log_level == "info"
     assert config.graceful_timeout == 10
+    assert config.token_limit_param == "max_tokens"
     # ServiceSettings 自带默认值，这里只确认「没被环境变量意外改掉」
     assert config.service == ServiceSettings()
+
+
+def test_token_limit_param_is_validated_and_wired_to_the_provider() -> None:
+    """NEXUS_TOKEN_LIMIT_PARAM：OpenAI 推理模型与兼容端点字段名不同。"""
+    config = parse_env(env(NEXUS_TOKEN_LIMIT_PARAM="max_completion_tokens"))
+    assert config.token_limit_param == "max_completion_tokens"
+
+    agent = build_agent(config)
+    provider = agent.provider
+    assert provider._token_limit_param == "max_completion_tokens"  # type: ignore[attr-defined]
+
+    # 拼错在启动期就是 EnvConfigError（退出码 2），不是上游的 400
+    with pytest.raises(EnvConfigError, match="NEXUS_TOKEN_LIMIT_PARAM"):
+        parse_env(env(NEXUS_TOKEN_LIMIT_PARAM="maxOutputTokens"))
 
 
 def test_blank_values_fall_back_to_defaults() -> None:
