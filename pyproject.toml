@@ -48,6 +48,9 @@ dev = [
     "mypy>=1.10",
     # 测试要覆盖 HTTP 层，所以 dev 里必须有它 —— CI 只装 .[dev]
     "fastapi>=0.110",
+    # 断线取消语义由 ASGI 服务器驱动（Starlette 按 spec_version 分两条
+    # 取消路径），进程内替身验不到 —— 测试里真起一个 uvicorn 再掐连接
+    "uvicorn>=0.30",
 ]
 
 # 容器和 systemd 都能直接调用它；``python -m nexus_agents.service`` 等价
